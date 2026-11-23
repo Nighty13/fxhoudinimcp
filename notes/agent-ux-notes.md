@@ -277,8 +277,8 @@ Building: stylized terrain (ridges, terraces, 5 erosion-driven layers), 15 proce
 
 **Result:** a believable sim, judged by numbers. 120 concrete pieces + 10 rebar bars (160 links) + steel ball;
 soft plastic links bend and hold; 108/281 pieces break (38%); settles by f240 (p99 speed 0.03 m/s). The VAT bake
-gives correct textures (281×240). UE import via the Labs Python importer works. **UE playback not yet right**
-(pieces black, standing half not at full height).
+gives correct textures (281×240). UE import via the Labs Python importer works. **UE playback works** (f6 impact,
+f24 break-up, f240 settled debris, colours from the col texture).
 
 **What made the difference (numbers over pictures):**
 - A permanent `sim_metrics` wrangle (displacement from rest, `broken`, `speed`) + `get_attrib_stats` percentiles per
@@ -308,6 +308,20 @@ gives correct textures (281×240). UE import via the Labs Python importer works.
 9. **`render_sheet` is client-side only** (spawns hython, takes a license seat): unusable from the plugin bridge and with
    a 1-seat license. Stitching 3 `render_viewport` frames with PIL worked: a server-side multi-frame strip is the fix.
 10. `get_node_card` reported "matched 85 of 80" (count bug, cosmetic).
+
+**UE playback bug: root cause and cost (biggest waste of this test, ~25 calls):**
+- The black, collapsed wall in UE was **all-zero VAT textures**. The Labs VAT ROP had `enablecooking=0`, set back after
+  the FBX workaround, and a re-bake with it off writes zero-filled EXRs **with no error**. I spent rounds on UE-side
+  suspects first: MI switches, data rounding, UVs, bounds, camera.
+- Checking the textures first would have taken one call. **Candidate: `start_render` / a `verify_outputs` step that
+  reads written images and flags all-constant ones** (min==max per channel). This is item 6, made concrete.
+- `execute_python` returning a big dict dumped ~15 KB of Labs Unity material YAML (parm strings) into context. **Truncate
+  long string values in returned values by default.**
+- The UE side: HighResShot / `AutomationLibrary.take_high_res_screenshot` silently write nothing while the editor window
+  is **minimized**. `ShowWindow(SW_RESTORE)` + an Alt tap before `SetForegroundWindow` fixed it. This belongs in a future
+  `ue_bridge` / UE guide.
+- The PowerShell heredoc→file and pipe paths add a UTF-8 BOM, which broke `exec()` in `execute_python`. **Strip a
+  leading U+FEFF in the code handler** (one line).
 
 ## 5. Session log
 
