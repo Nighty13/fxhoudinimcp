@@ -273,6 +273,42 @@ Building: stylized terrain (ridges, terraces, 5 erosion-driven layers), 15 proce
 - UE Python property names to remember: `aerial_pespective_view_distance_scale` (UE's own typo),
   `enable_volumetric_fog`, PPV fields need `override_<name>=True` first.
 
+## 4d. VAT destruction wall (concrete + continuous rebar → Labs VAT 4.0 → UE 5.8)
+
+**Result:** a believable sim, judged by numbers. 120 concrete pieces + 10 rebar bars (160 links) + steel ball;
+soft plastic links bend and hold; 108/281 pieces break (38%); settles by f240 (p99 speed 0.03 m/s). The VAT bake
+gives correct textures (281×240). UE import via the Labs Python importer works. **UE playback not yet right**
+(pieces black, standing half not at full height).
+
+**What made the difference (numbers over pictures):**
+- A permanent `sim_metrics` wrangle (displacement from rest, `broken`, `speed`) + `get_attrib_stats` percentiles per
+  frame. Tuning 3 settings at once by "broken %, p99 speed at f60/f160/f240" took 3 calls each, no screenshots.
+  **Candidate tool: `sim_report(node, frames, rest_node)`** returning exactly that table.
+- The new `root_errors` and `menu_items` (batch 1) paid off immediately: VEX typing errors and `connecttype` / `constrainttype`
+  tokens were one call each.
+
+**New friction / wished tools:**
+1. **build_network accepted an expression on a FOLDER parm** (`scatter1` is a folder in rbdmaterialfracture's multiparm;
+   the real count is `concrete_scatterpts1`). It should refuse writes to Folder/FolderSet parms.
+2. **`get_parameters(patterns=["*1"])` / `["f*"]` returned nothing.** Wildcards aren't supported; I fell back to
+   `execute_python` to list multiparm instance parms. Needs glob support.
+3. **`reset_simulation` doesn't know SOP solvers** (rbdbulletsolver's `resetsim` button). Identical numbers after a change
+   looked like "my fix had no effect"; it was a stale cache. `cook_frame_range` should offer `reset=True`.
+4. **Same VEX trap 4 times:** `point()` returns are ambiguous in comparisons, `addpoint()`, `setpointattrib()`. A guide
+   line "always assign point() to a typed variable" plus `validate_vex(code=...)` that compiles a snippet in a scratch
+   wrangle *before* it lands (today's `validate_vex` only cooks an existing node).
+5. **Packed-RBD knowledge gaps that cost several sim rounds (guide lines, not code):** `assemble` puts `name` on POINTS;
+   per-piece collision filtering is `collisiongroup` + `collisionignore` (patterns match the group, not names); embedded
+   rebar MUST ignore concrete or Bullet explodes the wall; `copytopoints` doesn't carry string attribs; `polywire` drops `name`.
+6. **start_render can't verify the Labs VAT ROP** (paths in `path_geo` / `path_pos` …) → "unverified" every time.
+7. **Labs VAT 4.0 + Houdini 22.0.508 writes an EMPTY FBX** (its internal FBX ROP exports an object inside the ROP
+   network). Workaround: object-merge `/out/vat/export/MESH/EXPORT` with `enablecooking=1` and export with a normal
+   FBX ROP. Every re-bake overwrites the fixed FBX: worth a tiny post-render script, and a report to SideFX.
+8. **`get_node_errors_detailed` repeats the same warning ~10×**: needs the same root/dedupe treatment as verify_network.
+9. **`render_sheet` is client-side only** (spawns hython, takes a license seat): unusable from the plugin bridge and with
+   a 1-seat license. Stitching 3 `render_viewport` frames with PIL worked: a server-side multi-frame strip is the fix.
+10. `get_node_card` reported "matched 85 of 80" (count bug, cosmetic).
+
 ## 5. Session log
 
 - 2026-11-23: River/terrain built (`HoudiniProjects/river_test`). 4 `execute_python` fallbacks: curve stash
