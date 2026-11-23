@@ -41,7 +41,7 @@
 
 An [MCP](https://modelcontextprotocol.io/) server for [SideFX Houdini](https://www.sidefx.com/): it lets an AI assistant build networks, set up simulations, inspect USD stages and render, through Houdini's own Python API. It works with any MCP client: Claude, Codex, Copilot, Gemini, Cursor, Windsurf, VS Code, Cline and others.
 
-**217 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
+**218 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
 
 <!-- --8<-- [start:features] -->
 | Category | Tools | Description |
@@ -50,7 +50,7 @@ An [MCP](https://modelcontextprotocol.io/) server for [SideFX Houdini](https://w
 | **Documentation** | 3 | Full-text search + page retrieval over Houdini's own shipped manual (version-exact) |
 | **Scene Management** | 10 | Open, save, import/export, scene info, connection status, undo/redo |
 | **Sessions** | 3 | Switch between open Houdini sessions, start a headless or GUI Houdini of the server's own, stop it |
-| **Node Operations** | 22 | Create, delete, copy, connect, layout, flags, network boxes, sticky notes, object transforms |
+| **Node Operations** | 23 | Create, delete, copy, connect, layout, flags, network boxes, sticky notes, one-call tidy + document, object transforms |
 | **Parameters** | 14 | Get/set values in bulk, expressions, keyframes, spare parameters |
 | **Geometry (SOPs)** | 17 | Curve control points, points, prims, attributes, attribute statistics, volume statistics and sampling, groups, sampling, nearest-point search |
 | **LOPs/USD** | 21 | Stage inspection, prims, world transforms over frames, layers, composition, variants, lighting |
@@ -84,7 +84,7 @@ flowchart LR
 
     subgraph MCP[" ⚡ FXHoudini MCP Server "]
         direction TB
-        B1("🔧 217 tools")
+        B1("🔧 218 tools")
         B2("📦 8 Resources")
         B3("💬 9 Prompts")
     end

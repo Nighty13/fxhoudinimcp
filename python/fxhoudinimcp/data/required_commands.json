@@ -132,6 +132,7 @@
     "nodes.set_node_flags",
     "nodes.set_node_position",
     "nodes.set_object_transform",
+    "nodes.tidy_network",
     "parameters.create_spare_parameter",
     "parameters.create_spare_parameters",
     "parameters.get_expression",

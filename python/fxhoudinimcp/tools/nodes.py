@@ -706,3 +706,33 @@ async def set_object_transform(
     if parent is not None:
         params["parent"] = parent
     return await bridge.execute("nodes.set_object_transform", params)
+
+
+@mcp.tool()
+async def tidy_network(
+    ctx: Context,
+    parent_path: str,
+    sections: list[dict[str, Any]] | None = None,
+    layout: bool | None = None,
+) -> dict:
+    """Finish a build: lay the network out and document it in ONE call.
+
+    Call this once when a network is done (and again after big changes: it
+    replaces its own boxes and notes). Each section becomes a titled,
+    coloured network box around its nodes with an optional one-line note,
+    so the user can read the graph: e.g. Inputs / Shaping / Simulation /
+    Outputs. Nodes outside every section come back in `undocumented`.
+
+    Args:
+        parent_path: Network to tidy (e.g. "/obj/geo1").
+        sections: In reading order, each {"title": str, "nodes": [node names
+            or paths], "note": optional one-line explanation,
+            "color": optional [r, g, b] in 0..1}.
+        layout: Lay the children out first. Omit to follow the server's
+            auto-layout setting; pass True/False to override.
+    """
+    bridge = _get_bridge(ctx)
+    params: dict[str, Any] = {"parent_path": parent_path, "sections": sections or []}
+    if layout is not None:
+        params["layout"] = layout
+    return await bridge.execute("nodes.tidy_network", params)

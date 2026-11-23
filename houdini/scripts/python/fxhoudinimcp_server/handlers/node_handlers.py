@@ -1911,3 +1911,122 @@ register_handler("nodes.set_node_flags", set_node_flags)
 register_handler("nodes.layout_children", layout_children)
 register_handler("nodes.set_node_position", set_node_position)
 register_handler("nodes.set_node_color", set_node_color)
+
+
+###### nodes.tidy_network
+
+_TIDY_PALETTE = [
+    (0.36, 0.52, 0.70),
+    (0.45, 0.62, 0.40),
+    (0.72, 0.56, 0.32),
+    (0.62, 0.42, 0.62),
+    (0.40, 0.62, 0.62),
+    (0.70, 0.42, 0.42),
+    (0.55, 0.55, 0.38),
+    (0.45, 0.45, 0.62),
+]
+_TIDY_NOTE_PREFIX = "mcp_note_"
+
+
+def tidy_network(
+    parent_path: str,
+    sections: list | None = None,
+    layout: bool | None = None,
+    **_: Any,
+) -> dict:
+    """Finish a build: lay the network out and document it, in one call.
+
+    Each section becomes a titled, coloured network box around its nodes,
+    with an optional one-line sticky note inside it. Calling it again
+    replaces boxes with the same title and the notes this tool made, so it
+    can be re-run after every change. Nodes left outside every section are
+    listed in `undocumented`.
+
+    Args:
+        parent_path: Network to tidy.
+        sections: [{"title": str, "nodes": [names or paths], "note": str?,
+            "color": [r, g, b]?}], in reading order.
+        layout: Lay the children out first. None follows the server's
+            auto-layout setting; True/False overrides it.
+    """
+    parent = _get_node(parent_path)
+    sections = sections or []
+    if layout is None:
+        layout = auto_layout_enabled()
+
+    titles = {sec.get("title") for sec in sections if sec.get("title")}
+    removed = 0
+    for box in list(parent.networkBoxes()):
+        if box.comment() in titles:
+            for note in list(box.stickyNotes()):
+                if note.name().startswith(_TIDY_NOTE_PREFIX):
+                    note.destroy()
+            box.destroy()
+            removed += 1
+
+    # Resolve sections first; unknown names are reported, not fatal.
+    resolved, missing = [], []
+    for sec in sections:
+        nodes = []
+        for ref in sec.get("nodes") or []:
+            node = parent.node(ref) or hou.node(ref)
+            if node is None or node.parent() != parent:
+                missing.append(ref)
+                continue
+            nodes.append(node)
+        resolved.append(nodes)
+    if layout:
+        # Stage-aware layout: each section is laid out as its own block and the
+        # blocks are placed left to right in reading order. One global layout
+        # interleaved the stages, so the boxes overlapped.
+        in_sections = {n.path() for nodes in resolved for n in nodes}
+        rest = [c for c in parent.children() if c.path() not in in_sections]
+        cursor = 0.0
+        for nodes in [*resolved, rest]:
+            if not nodes:
+                continue
+            parent.layoutChildren(items=nodes)
+            xs = [n.position()[0] for n in nodes]
+            ys = [n.position()[1] for n in nodes]
+            shift = hou.Vector2(cursor - min(xs), -max(ys))
+            for n in nodes:
+                n.setPosition(n.position() + shift)
+            cursor += (max(xs) - min(xs)) + 6.0
+
+    boxed, created = set(), []
+    for index, (sec, nodes) in enumerate(zip(sections, resolved, strict=True)):
+        if not nodes:
+            continue
+        box = parent.createNetworkBox()
+        box.setComment(sec.get("title") or f"Section {index + 1}")
+        box.setColor(hou.Color(*(sec.get("color") or _TIDY_PALETTE[index % len(_TIDY_PALETTE)])))
+        for node in nodes:
+            box.addItem(node)
+            boxed.add(node.path())
+        if sec.get("note"):
+            xs = [n.position()[0] for n in nodes]
+            ys = [n.position()[1] for n in nodes]
+            note = parent.createStickyNote(f"{_TIDY_NOTE_PREFIX}{index}")
+            note.setText(sec["note"])
+            note.setPosition(hou.Vector2(min(xs) - 0.5, max(ys) + 1.0))
+            note.setSize(hou.Vector2(max(4.0, max(xs) - min(xs) + 2.5), 0.9))
+            note.setColor(hou.Color(0.98, 0.96, 0.82))
+            box.addItem(note)
+        box.fitAroundContents()
+        created.append({"title": box.comment(), "nodes": len(nodes), "note": bool(sec.get("note"))})
+
+    undocumented = sorted(c.name() for c in parent.children() if c.path() not in boxed)
+    result = {
+        "success": True,
+        "parent_path": parent.path(),
+        "laid_out": bool(layout),
+        "boxes": created,
+        "replaced_boxes": removed,
+        "undocumented": undocumented,
+    }
+    if missing:
+        result["not_found"] = missing
+    return result
+
+
+register_handler("nodes.tidy_network", tidy_network)
