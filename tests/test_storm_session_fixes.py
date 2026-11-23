@@ -354,13 +354,13 @@ def test_failure_verdict_names_the_upstream_node():
     chain = fake_node("/out/cache_08_flip_mesh", ancestors=[fetch])
     monkey_hou = MagicMock()
     monkey_hou.node.side_effect = lambda p: {"/obj/FLIP_ocean/ww_cache": ww_cache}.get(p)
-    original = outputs.hou
+    original, original_reported = outputs.hou, outputs.reported_outputs
     outputs.hou = monkey_hou
     try:
         outputs.reported_outputs = lambda n: []
         verdict = outputs.failure_verdict(chain, [], "The attempted operation failed.")
     finally:
-        outputs.hou = original
+        outputs.hou, outputs.reported_outputs = original, original_reported
     assert verdict["errors"][0] == "The attempted operation failed."
     assert any("ww_solver" in e and "out of memory" in e for e in verdict["errors"])
     assert "ww_solver" in verdict["message"]

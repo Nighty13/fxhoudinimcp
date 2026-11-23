@@ -323,6 +323,14 @@ f24 break-up, f240 settled debris, colours from the col texture).
 - The PowerShell heredoc→file and pipe paths add a UTF-8 BOM, which broke `exec()` in `execute_python`. **Strip a
   leading U+FEFF in the code handler** (one line).
 
+**Done (2026-11-23), Houdini-side only; the UE capture item waits for a UE guide/bridge:**
+- `outputs.reported_outputs` falls back to a ROP's visible file parms (Labs VAT `path_pos/rot/col/geo`), listing only
+  the ones on disk, so VAT bakes are verified instead of "unverified" (item 6).
+- `write_verdict` adds `flat_images` + a message line when a written image is one constant value in every pixel
+  (OpenImageIO, skipped if missing). Live: a cooking-off VAT bake → 3 flat textures named; cooking-on → clean.
+- `execute_python` strips a leading BOM; strings nested in a returned list/dict are capped at 2000 chars.
+- Fixed a test leak (`test_storm_session_fixes` replaced `outputs.reported_outputs` for the rest of the run).
+
 ## 5. Session log
 
 - 2026-11-23: River/terrain built (`HoudiniProjects/river_test`). 4 `execute_python` fallbacks: curve stash

@@ -152,8 +152,77 @@ def _is_file_parm(parm) -> bool:
         return False
 
 
+_SCRIPT_PARMS = frozenset({"prerender", "postrender", "preframe", "postframe", "prerender_script"})
+
+
+def _rop_file_parms(node: hou.Node) -> list[dict[str, Any]]:
+    """Output files of a ROP whose path parms this module does not know by name.
+
+    The Labs VAT ROP writes to path_pos / path_rot / path_col / path_geo, so its
+    bakes always came back "unverified". On a ROP, file parms are outputs. Only
+    the ones that exist are listed, because a VAT ROP names files for every mode
+    (pos2, col2, lookup...) and writes three; when none exist, all are listed so
+    the verdict reads "nothing was written".
+    """
+    try:
+        if node.type().category().name() != "Driver":
+            return []
+        parms = [
+            p
+            for p in node.parms()
+            if p.name() not in _SCRIPT_PARMS and not p.isHidden() and _is_file_parm(p)
+        ]
+    except Exception:
+        return []
+    entries = []
+    for parm in parms:
+        with contextlib.suppress(Exception):
+            path = parm.eval()
+            if path and not os.path.isdir(path):
+                entries.append(_file_entry(parm.name(), path))
+    existing = [e for e in entries if e.get("exists")]
+    return existing or entries
+
+
+_IMAGE_EXTS = (".exr", ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".tga", ".hdr", ".rat")
+
+
+def flat_images(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> list[str]:
+    """Written images whose every channel is one constant value.
+
+    A Labs VAT bake with its internal cooking off wrote all-zero position,
+    rotation and colour textures with no error. The engine then drew every
+    piece at the origin in black, and the agent spent ~25 calls debugging the
+    engine side. Reading the pixels takes one call. Skipped when OpenImageIO
+    is not importable.
+    """
+    try:
+        import OpenImageIO as oiio
+    except Exception:
+        return []
+    prior = {entry.get("path"): entry for entry in before}
+    flat = []
+    for entry in after:
+        path = entry.get("path") or ""
+        if not entry.get("exists") or not path.lower().endswith(_IMAGE_EXTS):
+            continue
+        was = prior.get(path)
+        if was and was.get("mtime") == entry.get("mtime") and was.get("exists"):
+            continue
+        with contextlib.suppress(Exception):
+            stats = oiio.ImageBufAlgo.computePixelStats(oiio.ImageBuf(path))
+            if stats.min and all(lo == hi for lo, hi in zip(stats.min, stats.max, strict=True)):
+                flat.append(path)
+    return flat
+
+
 def reported_outputs(node: hou.Node) -> list[dict[str, Any]]:
     """The node's output path(s) and whether anything is on disk there."""
+    found = _known_outputs(node)
+    return found or _rop_file_parms(node)
+
+
+def _known_outputs(node: hou.Node) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     for name in OUTPUT_PARMS:
         parm = node.parm(name)
@@ -373,6 +442,13 @@ def write_verdict(
         verdict["output_verified"] = False
     else:
         verdict["message"] = f"{action} completed and wrote output."
+        flat = flat_images(before, after)
+        if flat:
+            verdict["flat_images"] = flat
+            verdict["message"] += (
+                f" But {len(flat)} written image(s) hold one constant value in every pixel "
+                f"(e.g. all zeros): the data likely never reached the writer. Check before using them."
+            )
     if warnings:
         verdict["warnings"] = warnings
     return verdict

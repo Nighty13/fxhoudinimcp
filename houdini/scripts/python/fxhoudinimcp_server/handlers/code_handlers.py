@@ -35,20 +35,35 @@ def _truncate_output(text: str) -> str:
     return text
 
 
-def _serialize_result(value: Any) -> Any:
-    """Convert arbitrary Python objects to JSON-safe types."""
+_MAX_NESTED_STRING = 2000
+
+
+def _serialize_result(value: Any, nested: bool = False) -> Any:
+    """Convert arbitrary Python objects to JSON-safe types.
+
+    Strings inside a returned list/dict are capped at _MAX_NESTED_STRING: a dict
+    of a Labs VAT ROP's string parms carried ~15 KB of embedded Unity material
+    YAML into the agent's context when it only wanted a few paths.
+    """
     if value is None:
         return None
-    if isinstance(value, (bool, int, float, str)):
-        return value
     if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        if nested and len(value) > _MAX_NESTED_STRING:
+            return (
+                value[:_MAX_NESTED_STRING]
+                + f"...[truncated {len(value) - _MAX_NESTED_STRING} chars]"
+            )
+        return value
+    if isinstance(value, (bool, int, float)):
+        return value
     if isinstance(value, (list, tuple)):
-        return [_serialize_result(v) for v in value]
+        return [_serialize_result(v, True) for v in value]
     if isinstance(value, dict):
-        return {str(k): _serialize_result(v) for k, v in value.items()}
+        return {str(k): _serialize_result(v, True) for k, v in value.items()}
     # Fallback: stringify
-    return str(value)
+    return _serialize_result(str(value), nested)
 
 
 ###### Handler: code.execute_python
@@ -66,6 +81,9 @@ def _execute_python(code: str, return_expression: str | None = None, **_: Any) -
     caller can see print() output and any warnings.
     """
     namespace: dict[str, Any] = {"hou": hou}
+    # Code read from a file written by PowerShell starts with a UTF-8 BOM, which
+    # exec() rejects as "invalid non-printable character U+FEFF".
+    code = code.lstrip("﻿")
 
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
