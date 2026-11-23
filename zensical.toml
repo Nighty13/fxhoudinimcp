@@ -24,6 +24,7 @@ nav = [
     { Overview = "how-to/index.md" },
     { Configuration = "how-to/configuration.md" },
     { Tools = "how-to/tools.md" },
+    { "Houdini + Unreal workflow" = "how-to/houdini-unreal-workflow.md" },
   ] },
   { Technical = "technical/" },
   { Changelog = "changelog.md" },

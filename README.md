@@ -25,6 +25,10 @@
 
 </div>
 
+> **This fork (Nighty13/fxhoudinimcp):** to set it up on a new machine and use it with Unreal Engine 5.8
+> (Houdini Engine, SideFX Labs VAT), follow [docs/how-to/houdini-unreal-workflow.md](docs/how-to/houdini-unreal-workflow.md).
+> Helper scripts live in [`extras/`](extras/); the agent friction log in [`notes/agent-ux-notes.md`](notes/agent-ux-notes.md).
+
 <!-- TABLE OF CONTENTS -->
 ## Table of Contents
 
