@@ -9,6 +9,7 @@ from __future__ import annotations
 # Built-in
 import collections
 import contextlib
+import math
 import random
 from typing import Any
 
@@ -1899,11 +1900,22 @@ def _grid_positions(prim: Any, most: int = 30000) -> list:
     step = float(min(voxel)) if isinstance(voxel, (tuple, list)) else float(voxel)
     if step <= 0:
         step = max(size) / 32 or 1.0
-    while (size[0] / step) * (size[1] / step) * (size[2] / step) > most:
+    # Count at least one sample per axis, as the grid below does: a thin axis
+    # (a heightfield's 1-voxel Y) made the estimate fractional and the loop stop
+    # with twice the samples asked for.
+    while math.prod(max(1.0, size[axis] / step) for axis in range(3)) > most:
         step *= 2
     counts = [max(1, int(size[axis] / step)) for axis in range(3)]
+    # Each axis is divided by its own count, so samples stay inside the box: a
+    # heightfield's box is one voxel thick, and the shared coarsened step put
+    # every sample above the slab, so compare_volumes read 0 on terrain layers.
+    steps = [size[axis] / counts[axis] for axis in range(3)]
     return [
-        [low[0] + (i + 0.5) * step, low[1] + (j + 0.5) * step, low[2] + (k + 0.5) * step]
+        [
+            low[0] + (i + 0.5) * steps[0],
+            low[1] + (j + 0.5) * steps[1],
+            low[2] + (k + 0.5) * steps[2],
+        ]
         for i in range(counts[0])
         for j in range(counts[1])
         for k in range(counts[2])

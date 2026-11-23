@@ -1993,6 +1993,58 @@ def _has_errors(node: hou.Node) -> bool:
     return False
 
 
+def _filter_matches(parm_filter: str, *texts: str) -> bool:
+    """Case-insensitive substring match; `a|b|c` matches any of the alternatives."""
+    terms = [t.strip().lower() for t in parm_filter.split("|") if t.strip()]
+    return any(term in text.lower() for term in terms for text in texts)
+
+
+def _inherited(errors: list) -> bool:
+    """True when every error is Houdini passing an upstream failure through."""
+    return bool(errors) and all("Invalid source" in str(e) for e in errors)
+
+
+def _collapse_inherited_errors(children: list, reports: list) -> list:
+    """Report each failure once: at its root, not on every node downstream of it.
+
+    One VEX typo used to be listed on 21 nodes, each repeating the full
+    upstream message (~15k chars). A node whose errors are all "Invalid
+    source ..." pass-throughs and which has an erroring input is reported as
+    `blocked_by` its root node(s) instead; its error text is dropped.
+    Returns the root failures as [{"path", "errors"}].
+    """
+    by_path = {r["path"]: r for r in reports}
+    # Snapshot first: collapsing a node drops its errors, which must not turn
+    # it into a root for nodes further downstream.
+    original = {p: list(r.get("errors") or []) for p, r in by_path.items()}
+    erroring = {p for p, errs in original.items() if errs}
+    inputs = {}
+    for child in children:
+        with contextlib.suppress(Exception):
+            inputs[child.path()] = [i.path() for i in child.inputs() if i is not None]
+
+    def roots_of(path: str, seen: set) -> set:
+        if path in seen:
+            return set()
+        seen.add(path)
+        upstream = [p for p in inputs.get(path, ()) if p in erroring]
+        if not upstream or not _inherited(original.get(path, [])):
+            return {path}
+        found = set()
+        for p in upstream:
+            found |= roots_of(p, seen)
+        return found or {path}
+
+    roots_by_path = {path: roots_of(path, set()) for path in erroring}
+    root_paths = set().union(*roots_by_path.values()) if roots_by_path else set()
+    for path, roots in roots_by_path.items():
+        if path not in roots:
+            report = by_path[path]
+            report.pop("errors", None)
+            report["blocked_by"] = sorted(roots)
+    return [{"path": p, "errors": original[p]} for p in sorted(root_paths)]
+
+
 def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict:
     """Inspect every node in a network: the 'middle-click everything' pass.
 
@@ -2057,12 +2109,14 @@ def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict
 
     error_nodes = [r["path"] for r in reports if r.get("errors")]
     licensing = license_error([e for r in reports for e in r.get("errors", ())])
+    root_errors = _collapse_inherited_errors(children, reports)
     result = {
         "parent_path": parent_path,
         "node_count": len(reports),
         "display_node": display.path() if display is not None else None,
         "geometry": _geometry_summary(display) if display is not None else None,
         "error_nodes": error_nodes,
+        "root_errors": root_errors,
         "stale_error_nodes": stale_nodes,
         "healthy": not error_nodes,
         # Named apart from the rest because no scene change fixes it.
@@ -2173,11 +2227,7 @@ def get_node_card(
     signatures = _vop_signatures(resolved) if context == "Vop" else []
     for template in [*resolved.parmTemplateGroup().entriesWithoutFolders(), *added_on_create]:
         name, label = template.name(), template.label()
-        if (
-            parm_filter
-            and parm_filter.lower() not in name.lower()
-            and parm_filter.lower() not in label.lower()
-        ):
+        if parm_filter and not _filter_matches(parm_filter, name, label):
             continue
         matched += 1
         if len(parms) >= _PARM_CAP:
@@ -2292,11 +2342,7 @@ def get_node_card(
         if found.get("folder_set") is None:
             continue
         labels = found.get("labels") or []
-        if (
-            parm_filter
-            and parm_filter.lower() not in name.lower()
-            and not any(parm_filter.lower() in label.lower() for label in labels)
-        ):
+        if parm_filter and not _filter_matches(parm_filter, name, *labels):
             continue
         matched += 1
         if len(parms) >= _PARM_CAP:

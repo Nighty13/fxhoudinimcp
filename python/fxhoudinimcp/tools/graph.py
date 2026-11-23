@@ -187,7 +187,8 @@ async def get_node_card(
         context: Category — "Sop", "Lop", "Vop" (MaterialX and other shader
             nodes inside a material network), "Dop", "Cop", "Chop", "Top",
             "Object", "Driver"; also "Cop2", "Shop", "VopNet".
-        parm_filter: Substring filter for the parameter list.
+        parm_filter: Case-insensitive substring filter for the parameter list;
+            `a|b|c` matches any of the alternatives (not a regex).
         include_help: The node's help text (about 4 KB). Default: included
             for a whole card, left out when parm_filter asks for specific
             parameters. Pass True or False to decide.

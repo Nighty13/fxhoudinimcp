@@ -46,6 +46,9 @@ OUTPUT_PARMS = (
     # Without it a Mantra render had no file to check: the verdict called a
     # render that wrote nothing "unverified", with success true.
     "vm_picture",
+    # HeightField Output's image path. Many nodes have a non-file parm named
+    # "output" (menus, toggles): it only counts when it is a file reference.
+    "output",
 )
 
 # Output values that are not files. "__render__.usd" is the in-memory stage a LOP
@@ -137,12 +140,26 @@ def _render_product_paths(node: hou.Node) -> list[str]:
         return []
 
 
+def _is_file_parm(parm) -> bool:
+    """Whether *parm* is a string parm holding a file path."""
+    try:
+        template = parm.parmTemplate()
+        return (
+            template.type() == hou.parmTemplateType.String
+            and template.stringType() == hou.stringParmType.FileReference
+        )
+    except Exception:
+        return False
+
+
 def reported_outputs(node: hou.Node) -> list[dict[str, Any]]:
     """The node's output path(s) and whether anything is on disk there."""
     found: list[dict[str, Any]] = []
     for name in OUTPUT_PARMS:
         parm = node.parm(name)
         if parm is None:
+            continue
+        if name == "output" and not _is_file_parm(parm):
             continue
         if name == "file" and any(entry["parm"] == "sopoutput" for entry in found):
             # A File Cache writes to sopoutput, which follows `file` in Explicit

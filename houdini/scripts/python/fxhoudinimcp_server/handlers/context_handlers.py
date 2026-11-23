@@ -189,71 +189,52 @@ def _get_network_overview(
         return result
 
     def _build_ascii_flow(children: tuple) -> str:
-        """Build a simple ASCII-art text of the network flow."""
+        """One line per node, inputs in connector order: the wiring, faithfully.
+
+        `name  type  <- in0, in1  [D][R][B][!]`. The old chain view followed
+        one output per node and squashed multi-input nodes into chains: on a
+        terrain network it showed a heightfield as the main input of a curve
+        wrangle and left the curve branch dangling. Nodes are listed sources
+        first (inputs before the nodes that read them); an unconnected input
+        slot below the last connected one is omitted, a gap shows as `-`.
+        """
         if not children:
             return "(empty network)"
+        by_path = {c.path(): c for c in children}
+        order, placed = [], set()
 
-        # Build chains by following outputs from source nodes
-        visited = set()
-        chains = []
+        def place(node, stack=()):
+            if node.path() in placed or node.path() in stack:
+                return
+            for inp in node.inputs():
+                if inp is not None and inp.path() in by_path:
+                    place(inp, stack + (node.path(),))
+            placed.add(node.path())
+            order.append(node)
 
-        # Find source nodes (no inputs connected from siblings)
-        sibling_paths = {c.path() for c in children}
-        source_nodes = []
         for child in children:
-            inputs = child.inputs()
-            has_sibling_input = False
-            for inp in inputs:
-                if inp is not None and inp.path() in sibling_paths:
-                    has_sibling_input = True
-                    break
-            if not has_sibling_input:
-                source_nodes.append(child)
-
-        if not source_nodes:
-            # Cycle or all connected; just start from first child
-            source_nodes = [children[0]]
-
-        def _follow_chain(node: hou.Node) -> list[str]:
-            chain = []
-            current = node
-            while current is not None and current.path() not in visited:
-                visited.add(current.path())
-                flags = _node_flags(current)
-                suffix = ""
-                if flags.get("display"):
-                    suffix += " [D]"
-                if flags.get("render"):
-                    suffix += " [R]"
-                if flags.get("bypass"):
-                    suffix += " [B]"
-                chain.append(current.name() + suffix)
-                # Follow first output that is a sibling
-                next_node = None
-                for out in current.outputs():
-                    if out.path() in sibling_paths and out.path() not in visited:
-                        next_node = out
-                        break
-                current = next_node
-            return chain
-
-        for src in source_nodes:
-            if src.path() not in visited:
-                chain = _follow_chain(src)
-                if chain:
-                    chains.append(chain)
-
-        # Also add any unvisited nodes
-        for child in children:
-            if child.path() not in visited:
-                chain = _follow_chain(child)
-                if chain:
-                    chains.append(chain)
-
+            place(child)
         lines = []
-        for chain in chains:
-            lines.append(" -> ".join(chain))
-        return "\n".join(lines) if lines else "(no connections)"
+        for node in order:
+            ins = [i.name() if i is not None else "-" for i in node.inputs()]
+            while ins and ins[-1] == "-":
+                ins.pop()
+            flags = _node_flags(node)
+            tags = "".join(
+                t
+                for k, t in (("display", "[D]"), ("render", "[R]"), ("bypass", "[B]"))
+                if flags.get(k)
+            )
+            with contextlib.suppress(Exception):
+                if node.errors():
+                    tags += "[!]"
+            line = f"{node.name()}  {node.type().name()}"
+            if ins:
+                line += "  <- " + ", ".join(ins)
+            if tags:
+                line += "  " + tags
+            lines.append(line)
+        return "\n".join(lines)
 
     root = _get_node(path)
     return _build_overview(root, depth)

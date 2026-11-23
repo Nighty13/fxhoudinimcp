@@ -38,7 +38,7 @@ previous shaping.
 - Masks drive parameters, so build the mask deliberately and visualise it. heightfield_visualize exists because a mask you cannot see is a mask you cannot debug.
 - heightfield_maskbyfeature (slope, height, curvature) is how you get masks that follow the terrain rather than hand-painting. Paint is for art direction, not for structure.
 - Scattering onto terrain reads the layers, so scatter after shaping and masking, not before.
-- heightfield_output converts to renderable geometry. Terrain stays a heightfield for as long as possible, because layers are lost on the way out.
+- heightfield_output exports layers to image files (16-bit PNG/EXR for a game-engine heightmap); convertheightfield turns a heightfield into polygons. Terrain stays a heightfield for as long as possible, because layers are lost on the way out.
 
 ## Order of work
 

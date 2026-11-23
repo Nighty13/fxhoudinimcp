@@ -362,6 +362,14 @@ def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
     if data_parm:
         result["data"] = data_parm["data"]
 
+    # Menu tokens, so a menu parm (int or string) can be set by name without
+    # pulling the whole schema: Copy to Points' pivot is "origin"/"centroid".
+    with contextlib.suppress(Exception):
+        items = list(pt.menuItems()) if hasattr(pt, "menuItems") else []
+        if items:
+            result["menu_items"] = items
+            result["menu_labels"] = list(pt.menuLabels())
+
     # Expression
     try:
         result["expression"] = parm.expression()
@@ -1061,16 +1069,32 @@ def _get_parameter_schema(
     node_path: str,
     parm_name: str | None = None,
     filter: str | None = None,
+    parm_names: list | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Get full parameter template info.
 
+    If *parm_names* is given, return info for exactly those parameters
+    (unknown names are listed in `not_found`).
     If *parm_name* is given, return info for that one parameter.
     If *filter* is given, return only parameters whose name or label
     contains the filter string (case-insensitive).
     Otherwise return all non-hidden parameters.
     """
     node = _resolve_node(node_path)
+
+    if parm_names:
+        found, missing = [], []
+        for name in parm_names:
+            parm = node.parm(name) or node.parmTuple(name)
+            if parm is None:
+                missing.append(name)
+            else:
+                found.append(_template_to_dict(parm.parmTemplate()))
+        result = {"node_path": node_path, "parameters": found}
+        if missing:
+            result["not_found"] = missing
+        return result
 
     if parm_name is not None:
         parm = node.parm(parm_name)

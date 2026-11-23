@@ -217,6 +217,21 @@ def list_commands() -> list[str]:
     return sorted(_handler_registry.keys())
 
 
+def _ignored_arguments(handler: Callable, params: dict) -> list[str]:
+    """Names in *params* the handler does not declare (swallowed by its **kwargs)."""
+    import inspect
+
+    try:
+        declared = {
+            p.name
+            for p in inspect.signature(handler).parameters.values()
+            if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+        }
+    except (TypeError, ValueError):
+        return []
+    return sorted(k for k in params if k not in declared)
+
+
 def _argument_error(command: str, handler: Callable, exc: TypeError) -> str | None:
     """Restate a signature mismatch in terms of the command and its arguments.
 
@@ -290,6 +305,11 @@ def dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
             with _undo_group(command):
                 result = handler(**params)
+            ignored = _ignored_arguments(handler, params)
+            if ignored and isinstance(result, dict):
+                # Handlers take **_, so a misspelled argument used to vanish and the
+                # call quietly did something else (parm_names -> every parm).
+                result["ignored_arguments"] = ignored
             return {"status": "success", "data": result}
         except TypeError as e:
             # A signature mismatch is Python talking about itself: "log_status()
@@ -302,11 +322,9 @@ def dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
                 raise
             return {
                 "status": "error",
-                "error": {
-                    "code": "BAD_ARGUMENTS",
-                    "message": argument_error,
-                    "traceback": traceback.format_exc(),
-                },
+                # No traceback: the message names the arguments, and the trace
+                # (always the dispatcher's own frame) was ~300 chars of noise.
+                "error": {"code": "BAD_ARGUMENTS", "message": argument_error},
             }
         except Exception as e:
             return {
