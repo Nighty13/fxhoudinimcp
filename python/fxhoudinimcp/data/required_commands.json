@@ -62,6 +62,7 @@
     "geometry.get_volume_info",
     "geometry.sample_geometry",
     "geometry.sample_volume",
+    "geometry.set_curve_points",
     "geometry.set_detail_attrib",
     "graph.build_network",
     "graph.cook_frame_range",

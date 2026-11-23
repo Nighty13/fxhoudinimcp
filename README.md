@@ -41,7 +41,7 @@
 
 An [MCP](https://modelcontextprotocol.io/) server for [SideFX Houdini](https://www.sidefx.com/): it lets an AI assistant build networks, set up simulations, inspect USD stages and render, through Houdini's own Python API. It works with any MCP client: Claude, Codex, Copilot, Gemini, Cursor, Windsurf, VS Code, Cline and others.
 
-**215 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
+**217 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
 
 <!-- --8<-- [start:features] -->
 | Category | Tools | Description |
@@ -52,7 +52,7 @@ An [MCP](https://modelcontextprotocol.io/) server for [SideFX Houdini](https://w
 | **Sessions** | 3 | Switch between open Houdini sessions, start a headless or GUI Houdini of the server's own, stop it |
 | **Node Operations** | 22 | Create, delete, copy, connect, layout, flags, network boxes, sticky notes, object transforms |
 | **Parameters** | 14 | Get/set values in bulk, expressions, keyframes, spare parameters |
-| **Geometry (SOPs)** | 16 | Points, prims, attributes, attribute statistics, volume statistics and sampling, groups, sampling, nearest-point search |
+| **Geometry (SOPs)** | 17 | Curve control points, points, prims, attributes, attribute statistics, volume statistics and sampling, groups, sampling, nearest-point search |
 | **LOPs/USD** | 21 | Stage inspection, prims, world transforms over frames, layers, composition, variants, lighting |
 | **DOPs** | 8 | Simulation info, DOP objects, step/reset, memory usage |
 | **PDG/TOPs** | 12 | Cook, work items, failed items and logs, schedulers, dependency graphs |
@@ -84,7 +84,7 @@ flowchart LR
 
     subgraph MCP[" ⚡ FXHoudini MCP Server "]
         direction TB
-        B1("🔧 215 tools")
+        B1("🔧 217 tools")
         B2("📦 8 Resources")
         B3("💬 9 Prompts")
     end

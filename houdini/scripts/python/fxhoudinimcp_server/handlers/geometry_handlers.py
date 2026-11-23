@@ -1959,3 +1959,98 @@ def _compare_volumes(
 
 
 register_handler("geometry.compare_volumes", _compare_volumes)
+
+
+###### geometry.set_curve_points
+
+
+def _curve_point_list(points: Any) -> list[tuple[float, float, float]]:
+    """Validate *points* as a list of at least two [x, y, z] positions."""
+    if not isinstance(points, (list, tuple)) or len(points) < 2:
+        raise ValueError("points must be a list of at least two [x, y, z] positions.")
+    out = []
+    for index, point in enumerate(points):
+        if not isinstance(point, (list, tuple)) or len(point) != 3:
+            raise ValueError(f"points[{index}] must be [x, y, z], got {point!r}.")
+        try:
+            out.append(tuple(float(c) for c in point))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"points[{index}] must hold numbers, got {point!r}.") from exc
+    return out
+
+
+def _set_curve_points(
+    *,
+    node_path: str,
+    points: list,
+    closed: bool = False,
+    **_: Any,
+) -> dict[str, Any]:
+    """Replace the control points of a Curve SOP.
+
+    Houdini 20+'s Curve SOP (curve::2.0) keeps what is drawn in the viewport
+    in a hidden geometry parameter, ``savedstashgeo``; it has no point-list
+    parameter, so neither set_parameter nor pressing "Update From Input"
+    then disconnecting the input sets it (the stash is only kept while an
+    input is wired). This writes one polygon through *points* into that
+    stash, which the user can then keep editing in the viewport. The legacy
+    Curve SOP's ``coords`` string is written instead when the node has one.
+    """
+    node = hou.node(node_path)
+    if node is None:
+        raise ValueError(f"Node not found: {node_path}")
+    positions = _curve_point_list(points)
+
+    stash = node.parm("savedstashgeo")
+    coords = node.parm("coords")
+    if stash is not None:
+        if any(inp is not None for inp in node.inputs()):
+            raise ValueError(
+                f"{node_path} has an input wired: the curve then edits its input's "
+                "geometry, not its own points. Disconnect the input first, or set "
+                "the points on the input node."
+            )
+        geo = hou.Geometry()
+        poly = geo.createPolygon()
+        poly.setIsClosed(bool(closed))
+        for position in positions:
+            point = geo.createPoint()
+            point.setPosition(position)
+            poly.addVertex(point)
+        stash.set(geo)
+        method = "savedstashgeo"
+    elif coords is not None:
+        coords.set(" ".join(",".join(repr(c) for c in p) for p in positions))
+        close = node.parm("close")
+        if close is not None:
+            close.set(int(bool(closed)))
+        method = "coords"
+    else:
+        raise ValueError(
+            f"{node_path} ({node.type().name()}) is not a Curve SOP: it has neither "
+            "a savedstashgeo nor a coords parameter."
+        )
+
+    # A cook error is reported below, not raised: the points were set.
+    with contextlib.suppress(Exception):
+        node.cook(force=True)
+    out = node.geometry()
+    result: dict[str, Any] = {
+        "success": True,
+        "node_path": node.path(),
+        "node_type": node.type().name(),
+        "method": method,
+        "point_count": len(positions),
+        "closed": bool(closed),
+        "output_point_count": len(out.points()) if out is not None else 0,
+        "output_prim_types": prim_type_counts(out) if out is not None else {},
+    }
+    errors: list = []
+    with contextlib.suppress(Exception):
+        errors = list(node.errors())
+    if errors:
+        result["cook_errors"] = errors
+    return result
+
+
+register_handler("geometry.set_curve_points", _set_curve_points)

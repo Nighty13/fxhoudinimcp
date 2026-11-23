@@ -16,7 +16,7 @@ import os
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import register_followup, register_handler
 from fxhoudinimcp_server.ui import (
     keep_viewer_state,
     require_ui,
@@ -44,6 +44,51 @@ def _no_mplay(settings) -> None:
         settings.outputToMPlay(False)
 
 
+def _grab_native_surface(rect):
+    """Grab the screen-space *rect* from the native window drawn there.
+
+    The smallest visible native widget (one with its own window handle) that
+    holds the whole rect is grabbed through that handle, which reads the
+    surface's own content even when another application's window covers
+    Houdini. Found by walking Houdini's widgets, not by widgetAt(): that
+    answers None when another application is on top (measured on Houdini
+    22.0.508 under a maximised Claude window). None when nothing holds the
+    rect or the grab is empty, so the caller falls back to the other paths.
+    """
+    try:
+        from PySide6 import QtCore, QtWidgets
+    except ImportError:
+        from PySide2 import QtCore, QtWidgets
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return None
+    with contextlib.suppress(Exception):
+        hou.ui.triggerUpdate()
+    app.processEvents()
+    widget = None
+    smallest = None
+    for top in app.topLevelWidgets():
+        for candidate in [top, *top.findChildren(QtWidgets.QWidget)]:
+            if candidate.windowHandle() is None or not candidate.isVisible():
+                continue
+            area = QtCore.QRect(candidate.mapToGlobal(QtCore.QPoint(0, 0)), candidate.size())
+            if not area.contains(rect):
+                continue
+            size = area.width() * area.height()
+            if smallest is None or size < smallest:
+                widget, smallest = candidate, size
+    if widget is None:
+        return None
+    screen = widget.screen() if hasattr(widget, "screen") else app.primaryScreen()
+    local = widget.mapFromGlobal(rect.topLeft())
+    pixmap = screen.grabWindow(
+        int(widget.winId()), local.x(), local.y(), rect.width(), rect.height()
+    )
+    if pixmap is None or pixmap.isNull():
+        return None
+    return pixmap
+
+
 def _capture_pane_tab_qt(pane_tab, output_path: str) -> None:
     """Capture a pane tab screenshot via Qt.
 
@@ -61,6 +106,13 @@ def _capture_pane_tab_qt(pane_tab, output_path: str) -> None:
         if widget is not None:
             pixmap = widget.grab()
 
+    if pixmap is None and hasattr(pane_tab, "qtScreenGeometry"):
+        # Houdini 21+ draws its whole UI into one native OpenGL surface
+        # (RE_OpenGLDrawable). QWidget.grab() cannot read it back and returns
+        # an uninitialised buffer: a noise image on Windows (network editor,
+        # Houdini 22.0.508). Grabbing through the surface's native window
+        # handle reads what the compositor holds for it instead.
+        pixmap = _grab_native_surface(pane_tab.qtScreenGeometry())
     if pixmap is None and hasattr(pane_tab, "qtScreenGeometry"):
         rect = pane_tab.qtScreenGeometry()
         try:
@@ -1071,19 +1123,50 @@ def capture_network_editor(
         "visible_bounds": visible_bounds,
     }
     if node_bounds is not None:
-        view = result["visible_bounds"]
         result["node_bounds"] = node_bounds
-        result["node_in_view"] = (
-            None
-            if view is None
-            else (
-                view[0] <= node_bounds[0]
-                and view[1] <= node_bounds[1]
-                and node_bounds[2] <= view[2]
-                and node_bounds[3] <= view[3]
-            )
-        )
+    _set_node_in_view(result)
     return result
+
+
+def _set_node_in_view(result: dict) -> None:
+    """Whether the framed node lies inside what the image shows."""
+    node_bounds = result.get("node_bounds")
+    if node_bounds is None:
+        return
+    view = result.get("visible_bounds")
+    result["node_in_view"] = (
+        None
+        if view is None
+        else (
+            view[0] <= node_bounds[0]
+            and view[1] <= node_bounds[1]
+            and node_bounds[2] <= view[2]
+            and node_bounds[3] <= view[3]
+        )
+    )
+
+
+def _recapture_network_editor(data: dict, params: dict) -> dict:
+    """Capture the editor again once Houdini has repainted it.
+
+    The handler's own grab ran in the same main-thread call that moved the
+    editor, before Houdini could redraw it, and on Houdini 22 that image
+    showed the editor's previous framing (measured on 22.0.508: framing OUT
+    then CONTROLS gave CONTROLS then OUT). The dispatcher calls this after
+    leaving the main thread idle, so this grab shows what was asked for.
+    """
+    network_editor = next(
+        (tab for tab in hou.ui.paneTabs() if tab.type() == hou.paneTabType.NetworkEditor),
+        None,
+    )
+    if network_editor is None:
+        return data
+    _capture_pane_tab_qt(network_editor, data["output_path"])
+    with contextlib.suppress(Exception):
+        data["visible_bounds"] = _bounds_list(network_editor.visibleBounds())
+    data["file_exists"] = os.path.isfile(data["output_path"])
+    _set_node_in_view(data)
+    return data
 
 
 ###### viewport.set_current_network
@@ -1337,6 +1420,7 @@ register_handler("viewport.frame_selection", frame_selection)
 register_handler("viewport.frame_all", frame_all)
 register_handler("viewport.capture_screenshot", capture_screenshot)
 register_handler("viewport.capture_network_editor", capture_network_editor)
+register_followup("viewport.capture_network_editor", _recapture_network_editor)
 register_handler("viewport.set_current_network", set_current_network)
 register_handler("viewport.find_error_nodes", find_error_nodes)
 register_handler("viewport.log_status", log_status)

@@ -162,6 +162,56 @@ def register_handler(command: str, handler: Callable) -> None:
     _handler_registry[command] = handler
 
 
+# Registry of command name -> (follow-up function, delay in seconds)
+_followup_registry: dict[str, tuple[Callable, float]] = {}
+
+
+def register_followup(command: str, followup: Callable, delay: float = 0.2) -> None:
+    """Run *followup* in a second main-thread call after *command* succeeds.
+
+    Houdini repaints a pane only once control is back in its event loop, so a
+    handler that moves a pane and then reads its pixels in the same call reads
+    the frame from before the move. The follow-up is called as
+    ``followup(data, params)`` with the handler's result after *delay*
+    seconds, during which the main thread is free to redraw; whatever it
+    returns replaces the result data.
+
+    Args:
+        command: Dotted command name the follow-up belongs to.
+        followup: Function taking (data, params) and returning the new data.
+        delay: Seconds to leave the main thread idle before the follow-up.
+    """
+    _followup_registry[command] = (followup, delay)
+
+
+def _run_followup(
+    command: str, params: dict[str, Any], result: dict[str, Any], on_main
+) -> dict[str, Any]:
+    """Apply *command*'s registered follow-up to a successful *result*."""
+    entry = _followup_registry.get(command)
+    if entry is None or result.get("status") != "success":
+        return result
+    followup, delay = entry
+
+    def _execute():
+        try:
+            return {"status": "success", "data": followup(result["data"], params)}
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": {
+                    "code": type(e).__name__,
+                    "message": readable_message(e),
+                    "traceback": traceback.format_exc(),
+                },
+            }
+
+    if on_main is None:
+        return _execute()
+    time.sleep(delay)
+    return on_main(_execute)
+
+
 def list_commands() -> list[str]:
     """Return all registered command names."""
     return sorted(_handler_registry.keys())
@@ -336,10 +386,12 @@ def dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
                     },
                 }
             else:
-                result = container["result"]
+                result = _run_followup(
+                    command, params, container["result"], hdefereval.executeInMainThreadWithResult
+                )
         else:
             # Fallback for hython (single-threaded, no hdefereval needed)
-            result = _execute()
+            result = _run_followup(command, params, _execute(), None)
     except Exception as e:
         result = {
             "status": "error",

@@ -162,6 +162,31 @@ async def set_detail_attrib(
 
 
 @mcp.tool()
+async def set_curve_points(
+    ctx: Context,
+    node_path: str,
+    points: list[list[float]],
+    closed: bool = False,
+) -> dict:
+    """Set the control points of a Curve SOP (curve::2.0 or the legacy curve).
+
+    Use this to lay out a spline the user will keep editing in the viewport
+    (a river, a road, a path). The Curve SOP has no point-list parameter, so
+    set_parameter cannot do this. The node must have no input wired.
+
+    Args:
+        node_path: Curve SOP path.
+        points: Control points in order, each [x, y, z]; at least two.
+        closed: Close the curve into a loop.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "geometry.set_curve_points",
+        {"node_path": node_path, "points": points, "closed": closed},
+    )
+
+
+@mcp.tool()
 async def get_groups(ctx: Context, node_path: str) -> dict:
     """List all geometry groups on a SOP node.
 
