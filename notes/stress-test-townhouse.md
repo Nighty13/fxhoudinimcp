@@ -140,6 +140,25 @@ Findings:
     profile clamp is what makes the grade. Large fills (up to 50 m) show where
     a bridge belongs: a bridge/tunnel pass is the natural next feature.
 
+### Round 3b: road realism (user review: "dangerous, noisy, stamped too tight")
+
+- Plan: a subdivision spline through control points every Alignment
+  Smoothness metres replaces smoothing the 6 m grid path. Measured per
+  spacing (30/45/60/80 m): radius p5 8.3/8.7/10.5/16.2 m, median
+  38/57/61/97 m, one remaining 7.8 m hairpin at 80 m; default 80.
+- Profile: moving average over a Vertical Curve Length (80 m of run) alternated
+  with the grade clamp, four passes, clamp last: grade mean 7.8% -> 5.6%,
+  max 8.0%, no more riding the limit through every bump.
+- Cross-section: 7 m asphalt + 1.5 m gravel shoulders + 2.5 m dirt verges,
+  flat formation 15 m; earthwork by swept skirts at Fill Slope 1.8:1 (max) and
+  Cut Slope 1:1 (min) before the formation is projected. Barriers at the
+  shoulder edge, probe 4 m past the verge: 17 runs -> 2 (gentle fills no longer
+  read as drops). Centre line dashed every 3 m.
+- MCP friction seen: set_parameters on a wrangle `snippet` echoes the whole
+  code back (set_wrangle_code does not); every merge of differently
+  attributed inputs reports a mismatch warning that verify_network lists as
+  an issue (noise in an otherwise clean report).
+
 ## Guide notes worth adding
 
 - attribrandomize on a vector randomizes channels independently (pink/green
