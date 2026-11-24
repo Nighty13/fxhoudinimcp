@@ -24,6 +24,7 @@ async def create_wrangle(
     justification: str,
     run_over: str = "Points",
     name: str | None = None,
+    inputs: list[str] | None = None,
 ) -> dict:
     """Create an Attribute Wrangle node with VEX code.
 
@@ -45,6 +46,8 @@ async def create_wrangle(
             logic.
         run_over: Element to run over ("Points", "Vertices", "Primitives", "Detail", "Numbers").
         name: Node name.
+        inputs: Nodes to wire into inputs 0, 1, ... (paths or sibling
+            names), wired before the code is checked.
     """
     bridge = _get_bridge(ctx)
     params: dict = {
@@ -54,6 +57,8 @@ async def create_wrangle(
     }
     if name is not None:
         params["name"] = name
+    if inputs:
+        params["inputs"] = inputs
     result = await bridge.execute("vex.create_wrangle", params)
     if isinstance(result, dict):
         result["justification"] = justification

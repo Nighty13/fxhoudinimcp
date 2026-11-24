@@ -81,6 +81,30 @@ _MULTIPARM_FOLDERS = tuple(
 )
 
 
+def native_menu_callback(node, parm_name: str) -> bool:
+    """Run a native node's menu callback after a write, as editing it in the UI does.
+
+    Measure's type menu renames its output attribute (area -> perimeter) from
+    a C++ callback: no script, so run_callbacks never ran it. Set from
+    build_network, measure=perimeter still wrote `area`, and a blast on
+    `@perimeter` matched nothing, without an error. Only native (non-HDA)
+    nodes: their callbacks are C++ and cannot open Python's modal error
+    window. Answers whether it ran.
+    """
+    with contextlib.suppress(Exception):
+        parm = node.parm(parm_name)
+        if parm is None or node.type().definition() is not None:
+            return False
+        template = parm.parmTemplate()
+        if not template.menuItems() or template.type() == hou.parmTemplateType.Button:
+            return False
+        if template.scriptCallback():
+            return False  # a scripted callback is run_callbacks' job
+        parm.pressButton()
+        return True
+    return False
+
+
 _HEAVY_DISPLAY_PRIMS = 1_000_000
 _HEAVY_NODE_PRIMS = 100_000
 _HEAVY_GROWTH = 100
@@ -1512,10 +1536,13 @@ def build_network(
                 errors.append(_unknown_key_error(label, "spec", key, _SPEC_KEYS))
         if spec.get("insert_after") is not None:
             target = str(spec["insert_after"])
-            if parent.node(target) is None:
+            # A node built earlier in this same spec counts: measure then blast
+            # spliced in one call took two before.
+            earlier = {s.get("name") for s in nodes[:index] if isinstance(s, dict)}
+            if parent.node(target) is None and target not in earlier:
                 errors.append(
-                    f"node {label}: insert_after '{target}' is not an existing child of "
-                    f"{parent_path} (insert after a node that is already built)"
+                    f"node {label}: insert_after '{target}' is neither an existing child of "
+                    f"{parent_path} nor a node named earlier in this spec"
                 )
             end = spec.get("insert_output")
             names = {s.get("name") for s in nodes if isinstance(s, dict)}
@@ -1944,6 +1971,8 @@ def build_network(
         target_name = spec.get("insert_after")
         if target_name is not None and str(target_name) not in readers:
             target = parent.node(str(target_name))
+            if target is None:
+                continue  # built by this spec: its readers are read when it is spliced
             readers[str(target_name)] = [
                 (conn.outputNode(), conn.inputIndex(), conn.outputIndex())
                 for conn in target.outputConnections()
@@ -1974,6 +2003,10 @@ def build_network(
                     ) from exc
                 for kind, found in written.items():
                     parm_reports.setdefault(node.path(), {}).setdefault(kind, {}).update(found)
+                if spec.get("run_callbacks") is not False and native_menu_callback(node, parm_name):
+                    parm_reports.setdefault(node.path(), {}).setdefault("menu_callbacks_run", {})[
+                        parm_name
+                    ] = True
             # "build_network cannot set expressions" was a live session's stated
             # reason for rebuilding a lantern rig in execute_python. It can, from
             # `expressions`, from `exprs`, or from an {"expr": ...} value in `parms`.
@@ -2050,6 +2083,14 @@ def build_network(
             if target_name is None:
                 continue
             target = parent.node(str(target_name))
+            if str(target_name) not in readers:
+                # A node this spec built and an earlier insert_after spliced in:
+                # its readers are the ones that splice moved onto it, now.
+                readers[str(target_name)] = [
+                    (conn.outputNode(), conn.inputIndex(), conn.outputIndex())
+                    for conn in target.outputConnections()
+                    if conn.outputNode() is not node
+                ]
             if not spec.get("inputs"):
                 node.setInput(0, target, 0)
             end = created.get(spec.get("insert_output")) or node
@@ -2953,9 +2994,25 @@ def find_expensive_nodes(
 
     targets: list[hou.Node] = []
     _NODE_CAP = 300
+
+    def _add(node, depth: int) -> None:
+        # A SOP subnet or asset is cooked through its own children first: a
+        # force-cook of the asset alone reuses its cached insides, which then
+        # record as zero (a 70-node Terrain Road asset ranked nothing). One
+        # level only: descending into shipped assets inside it (HeightField
+        # Mask by Geometry) force-cooked their insides one by one and
+        # reported 3.3 s for a network that cooks in 0.65 s.
+        if depth < 1 and getattr(node, "displayNode", None) and node.displayNode() is not None:
+            for inner in node.children():
+                if len(targets) >= _NODE_CAP:
+                    return
+                _add(inner, depth + 1)
+        if len(targets) < _NODE_CAP:
+            targets.append(node)
+
     for container in containers:
         for child in container.children():
-            targets.append(child)
+            _add(child, 0)
             if len(targets) >= _NODE_CAP:
                 break
         if len(targets) >= _NODE_CAP:

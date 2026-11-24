@@ -311,3 +311,53 @@ def test_attrib_stats_reads_the_output_it_is_asked_for(monkeypatch):
     assert seen[-1]["output_index"] == 1
     geometry._get_attrib_stats(node_path="/obj/b/building")
     assert "output_index" not in seen[-1]
+
+
+###### native menu callbacks, wrangle inputs
+
+
+def _menu_parm(callback=""):
+    parm = MagicMock()
+    template = parm.parmTemplate.return_value
+    template.menuItems.return_value = ("area", "perimeter")
+    template.type.return_value = "Menu"
+    template.scriptCallback.return_value = callback
+    return parm
+
+
+def test_a_native_menu_callback_runs_after_a_write():
+    node = MagicMock()
+    node.type.return_value.definition.return_value = None
+    parm = _menu_parm()
+    node.parm.return_value = parm
+    assert graph.native_menu_callback(node, "measure") is True
+    parm.pressButton.assert_called_once()
+
+
+def test_an_asset_or_scripted_callback_is_left_alone():
+    asset = MagicMock()
+    asset.type.return_value.definition.return_value = object()
+    asset.parm.return_value = _menu_parm()
+    assert graph.native_menu_callback(asset, "mode") is False
+    scripted = MagicMock()
+    scripted.type.return_value.definition.return_value = None
+    scripted.parm.return_value = _menu_parm(callback="hou.pwd()...")
+    assert graph.native_menu_callback(scripted, "mode") is False
+    scripted.parm.return_value.pressButton.assert_not_called()
+
+
+def test_a_wrangle_is_wired_before_its_code_is_checked(monkeypatch):
+    import fxhoudinimcp_server.handlers.vex_handlers as vex
+
+    parent, node, upstream = MagicMock(), MagicMock(), MagicMock()
+    upstream.path.return_value = "/obj/t/ROAD_CURVE"
+    parent.node.return_value = upstream
+    parent.createNode.return_value = node
+    node.parent.return_value = None
+    monkeypatch.setattr(vex.hou, "node", lambda path: parent)
+    monkeypatch.setattr(vex, "_resolve_class_value", lambda n, r: 0)
+    monkeypatch.setattr(vex, "_focus_network_editor", lambda n: None)
+    monkeypatch.setattr(vex, "_validate_vex_quick", lambda n: {"vex_valid": True})
+    result = vex.create_wrangle("/obj/t", "f@a = 1;", inputs=["ROAD_CURVE"])
+    node.setInput.assert_called_once_with(0, upstream)
+    assert result["inputs"] == ["/obj/t/ROAD_CURVE"]

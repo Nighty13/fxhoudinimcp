@@ -125,13 +125,14 @@ Findings:
     open and closed polygons are mixed).
 19. **Measure's attribute name follows its type only through a UI callback**:
     measure=perimeter still wrote `area`, and a blast on `@perimeter` matched
-    nothing (no error). Same class as the res_mode trap; build_network could
-    run callbacks for menus whose callback renames an output (open).
+    nothing (no error). Fixed: build_network presses a native node's menu
+    after writing it, as the UI edit does (`menu_callbacks_run`).
 20. **find_expensive_nodes on an object holding an HDA ranks nothing**
-    (`top_nodes: []`); it has to be pointed inside the asset (open).
-21. **insert_after cannot chain in one build** (#7 again, still open).
+    (`top_nodes: []`). Fixed: assets one level down are cooked through their
+    own children (Terrain Road: 851 ms, find_road 247 ms on top).
+21. **insert_after cannot chain in one build** (fixed, #7 too).
 22. **create_wrangle does not wire inputs**: the wrangle came back unconnected
-    and needed a connect_nodes_batch (open; it takes no `inputs`).
+    and needed a connect_nodes_batch (fixed: `inputs=`).
 23. The watcher reported real edits correctly twice this round (the user moved
     display flags in the subnet while I built); no false positives seen.
 24. Grade realism needs cut/fill: the cheapest path on a 160 m relief has no

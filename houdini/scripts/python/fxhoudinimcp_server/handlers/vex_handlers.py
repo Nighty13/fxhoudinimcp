@@ -262,8 +262,14 @@ def create_wrangle(
     vex_code: str,
     run_over: str = "Points",
     name: str = None,
+    inputs: list[str] | None = None,
 ) -> dict:
     """Create an Attribute Wrangle node with VEX code.
+
+    *inputs* wires the wrangle before its code is checked: node paths or
+    sibling names, in input order. Without them a measuring wrangle came back
+    unconnected (and its point()/volumesample() reads compiled against
+    nothing), and a connect_nodes_batch had to follow.
 
     Args:
         parent_path: Path to the parent SOP network.
@@ -284,6 +290,15 @@ def create_wrangle(
             node = parent.createNode("attribwrangle")
     except hou.OperationFailed as e:
         raise ValueError(f"Failed to create attribwrangle node: {readable_message(e)}") from e
+
+    wired = []
+    for index, source in enumerate(inputs or []):
+        upstream = hou.node(source) if str(source).startswith("/") else parent.node(str(source))
+        if upstream is None:
+            node.destroy()
+            raise ValueError(f"inputs[{index}]: no node '{source}' (a path, or a sibling name)")
+        node.setInput(index, upstream)
+        wired.append(upstream.path())
 
     # Set the VEX snippet
     snippet_parm = node.parm("snippet")
@@ -313,6 +328,7 @@ def create_wrangle(
         "node_name": node.name(),
         "run_over": run_over,
         "vex_code": vex_code,
+        **({"inputs": wired} if wired else {}),
         "channel_prefix": "../",
         "channel_ancestors": ancestors,
         "channel_hint": (
