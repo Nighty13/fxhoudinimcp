@@ -361,3 +361,14 @@ def test_a_wrangle_is_wired_before_its_code_is_checked(monkeypatch):
     result = vex.create_wrangle("/obj/t", "f@a = 1;", inputs=["ROAD_CURVE"])
     node.setInput.assert_called_once_with(0, upstream)
     assert result["inputs"] == ["/obj/t/ROAD_CURVE"]
+
+
+def test_switching_a_parameter_tab_is_not_an_edit():
+    tabs = MagicMock()
+    tabs.parmTemplate.return_value.type.return_value = watch.hou.parmTemplateType.FolderSet
+    tabs.parmTemplate.return_value.folderType.return_value = "Tabs"
+    assert watch._tab_switch(tabs) is True
+    radio = MagicMock()
+    radio.parmTemplate.return_value.type.return_value = watch.hou.parmTemplateType.FolderSet
+    radio.parmTemplate.return_value.folderType.return_value = watch.hou.folderType.RadioButtons
+    assert watch._tab_switch(radio) is False

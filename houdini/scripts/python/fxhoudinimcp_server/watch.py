@@ -80,6 +80,21 @@ def _driven(parm_tuple: Any) -> bool:
     return False
 
 
+def _tab_switch(parm_tuple: Any) -> bool:
+    """A tab folder's value is which tab the parameter pane shows: UI, not an edit.
+
+    Opening the Terrain tab of an asset was reported as "parm terrain"
+    changed. A radio folder's index is a real value and still counts.
+    """
+    with contextlib.suppress(Exception):
+        template = parm_tuple.parmTemplate()
+        if template.type() != hou.parmTemplateType.FolderSet:
+            return False
+        radio = getattr(hou.folderType, "RadioButtons", None)
+        return template.folderType() != radio
+    return False
+
+
 def _on_event(event_type: Any = None, **kwargs: Any) -> None:
     """Houdini node event callback. Ignores everything inside an MCP call."""
     if _depth > 0:
@@ -94,7 +109,7 @@ def _on_event(event_type: Any = None, **kwargs: Any) -> None:
         name = getattr(event_type, "name", lambda: str(event_type))()
         if name == "ParmTupleChanged":
             parm_tuple = kwargs.get("parm_tuple")
-            if parm_tuple is not None and _driven(parm_tuple):
+            if parm_tuple is not None and (_driven(parm_tuple) or _tab_switch(parm_tuple)):
                 return
             _record(path, f"parm {parm_tuple.name()}" if parm_tuple is not None else "parms")
         elif name == "FlagChanged":

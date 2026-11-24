@@ -159,6 +159,27 @@ Findings:
   attributed inputs reports a mismatch warning that verify_network lists as
   an issue (noise in an otherwise clean report).
 
+### Round 3c: clearance, guardrails, protected erosion
+
+- Flat Clearance (3 m each side, exposed) between the verge and the cut/fill
+  slopes: the flat formation is 21 m at defaults, 31 m at 8 m clearance.
+- Guardrails: probe 3 m past the clearance, drop blurred along the edge so
+  short dips do not break a run, threshold 1.2 m, W-beam rail at 0.6 m on
+  posts every 2 m: 8 runs, 614 m (~42% of both edges, all fill/downhill
+  sides). Found on the way: the clearance pushed the probe past Attribute
+  Transfer's 8 m threshold, `ground` stayed 0 and every point read a 21-67 m
+  "drop" (both edges fully railed); threshold now follows the geometry and
+  `ground` defaults to the edge height so a missed transfer reads no drop.
+- Erosion: protect (inverted blurred corridor as erodability mask) -> erode
+  (frozen 12 frames, 1.3 s from reset) -> lock (stamped height copied back
+  inside the corridor). Terrain median -4 m, channels to -39 m, deposits to
+  +39 m; road gap to final ground +-2.5 cm at p1/p99 (4 end points excepted).
+- MCP findings: SideFX's own help lists heightfield_erode's feature size as
+  `featuresize`; the parm is `erosionscale`. The did-you-mean for an
+  expression on an unknown parm matches names only (offered `dofreeze`),
+  where the literal path matches labels too (open). The watcher reported a
+  parameter-pane tab switch as an edit (fixed: tab folders ignored).
+
 ## Guide notes worth adding
 
 - attribrandomize on a vector randomizes channels independently (pink/green
