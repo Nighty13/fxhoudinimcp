@@ -752,7 +752,8 @@ def _write_parm(
     if before is not None and override_expression:
         _clear_expression(parm)
         through = None
-    parm.set(value)
+    # A token on an Int menu (color's class "point"): the card lists tokens.
+    parm.set(int_menu_value(parm, value))
     callback = _run_callback(parm) if run_callbacks else None
     after = _expression_of(parm)
     new_value = _serialize_value(parm.eval())
@@ -3016,6 +3017,19 @@ def _restore_parm(parm: hou.Parm, state: dict[str, Any]) -> None:
         parm.setExpression(*state["expression"])
     elif state["keys"]:
         parm.setKeyframes(state["keys"])
+
+
+def int_menu_value(parm: hou.Parm, value: Any) -> Any:
+    """A token written to an Int menu parm (color's class "point") becomes its index.
+
+    Only Int templates: a String menu keeps its token, and a parm that cannot
+    say what it is gets the value unchanged, so Houdini answers as before.
+    """
+    if isinstance(value, str):
+        with contextlib.suppress(Exception):
+            if parm.parmTemplate().type() == hou.parmTemplateType.Int:
+                return _menu_index(parm, value)
+    return value
 
 
 def _menu_index(parm: hou.Parm, value: Any) -> Any:

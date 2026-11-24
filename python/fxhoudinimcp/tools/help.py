@@ -27,6 +27,8 @@ async def search_help(
     """Search the running Houdini's own documentation — concepts,
     workflows, VEX functions, expression functions, HOM API, and every
     effects manual SideFX ships. Version-exact, straight from the install.
+    Packages on HOUDINI_PATH are searched too: SideFX Labs node pages come
+    back as nodes/sop/labs--edge_damage-2.1 beside the core nodes.
 
     Use this BEFORE improvising: when unsure how a workflow is meant to
     be done ("pyro shaping", "vellum constraints"), what a VEX or

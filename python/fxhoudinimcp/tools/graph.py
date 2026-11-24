@@ -122,7 +122,9 @@ async def build_network(
 
 
 @mcp.tool()
-async def verify_network(ctx: Context, parent_path: str, force_cook: bool = False) -> dict:
+async def verify_network(
+    ctx: Context, parent_path: str, force_cook: bool = False, all_nodes: bool = False
+) -> dict:
     """Inspect every node in a network at once — errors, warnings, flags,
     and the display node's cooked geometry counts.
 
@@ -143,15 +145,21 @@ async def verify_network(ctx: Context, parent_path: str, force_cook: bool = Fals
     compiled). force_cook=True cooks them (sims, caches, ROPs excluded) and
     every for-each block end, listed in `cooked_off_display`.
 
+    `nodes` lists only the nodes with something to report; the rest are
+    counted in `clean_nodes`. Geometry evidence carries `open_polygons` when
+    some polygons are open polylines (walls that draw as wires).
+
     Args:
         parent_path: Network to verify (e.g. "/obj/geo1").
         force_cook: Cook the display node with force, cook side branches,
             wrangles and block ends, and recook every node that has errors,
             so the verdict is about the whole network as it is now.
+        all_nodes: List every node, clean ones included.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
-        "graph.verify_network", {"parent_path": parent_path, "force_cook": force_cook}
+        "graph.verify_network",
+        {"parent_path": parent_path, "force_cook": force_cook, "all_nodes": all_nodes},
     )
 
 

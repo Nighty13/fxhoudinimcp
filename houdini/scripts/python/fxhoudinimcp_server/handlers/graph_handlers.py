@@ -46,6 +46,7 @@ from fxhoudinimcp_server.handlers.node_handlers import (
     _input_table,
     _output_index,
     _resolve_input_index,
+    apply_tab_defaults,
 )
 from fxhoudinimcp_server.handlers.parameter_handlers import (
     LockedParmError,
@@ -55,6 +56,7 @@ from fxhoudinimcp_server.handlers.parameter_handlers import (
     _run_callback,
     _wrapped_expression,
     broken_references,
+    int_menu_value,
     is_ramp_value,
     locked_message,
     ramp_from_value,
@@ -744,6 +746,15 @@ def _parm_names_for_type(
 _PARM_PROBE_CACHE: dict[tuple, tuple] = {}
 
 
+def int_menu_tokens(node_type: Any, parm_name: str) -> list[str]:
+    """The static menu tokens of an Int parm (color's class), [] for anything else."""
+    with contextlib.suppress(Exception):
+        template = node_type.parmTemplateGroup().find(parm_name)
+        if template is not None and template.type() == hou.parmTemplateType.Int:
+            return [str(token) for token in template.menuItems()]
+    return []
+
+
 def _menu_error(parm_name: str, value: Any, tokens: list[str]) -> str | None:
     """Why `value` cannot be set on a strict menu parm, or None if it can.
 
@@ -981,7 +992,7 @@ def _set_parm_value(name: str, parm, parm_tuple, value: Any) -> set[str]:
     elif parm is not None and is_ramp_value(value):
         parm.set(ramp_from_value(parm, value))
     elif parm is not None:
-        parm.set(value)
+        parm.set(int_menu_value(parm, value))
     elif parm_tuple is not None:
         # Scalar onto a tuple: broadcast across components.
         if isinstance(value, (int, float)):
@@ -1214,10 +1225,15 @@ def _geometry_summary(node: hou.Node) -> dict[str, Any] | None:
         "point_attribs": [a.name() for a in geo.pointAttribs()][:30],
     }
     with contextlib.suppress(Exception):
-        from fxhoudinimcp_server.handlers.geometry_handlers import prim_type_counts
+        from fxhoudinimcp_server.handlers.geometry_handlers import (
+            open_polygon_count,
+            prim_type_counts,
+        )
 
         if types := prim_type_counts(geo):
             summary["prim_types"] = types
+        if open_count := open_polygon_count(geo):
+            summary["open_polygons"] = open_count
     # A heightfield or a pyro source is volumes: "7 points, attrib P" said
     # nothing about which layers exist or whether they hold anything.
     with contextlib.suppress(Exception):
@@ -1701,13 +1717,26 @@ def build_network(
                     # non-numeric value" plus a dump of the C++ overloads,
                     # raised mid-build, so the whole graph rolled back. Caught
                     # here instead, in terms of what the caller meant.
-                    errors.append(
-                        f"node {label}: parm '{parm_name}' is numeric "
-                        f"({templates[parm_name]}) and will not take the string "
-                        f"{value!r}. To set it as an expression, write "
-                        f'"{parm_name}": {{"expr": {value!r}}} or put it in the '
-                        f"spec's 'expressions' block."
-                    )
+                    tokens = int_menu_tokens(resolved_types.get(spec.get("type")), parm_name)
+                    if value in tokens:
+                        # An Int menu (color's class, normal's method) takes
+                        # its token: the card lists tokens, so they are written.
+                        pass
+                    elif tokens:
+                        close = get_close_matches(value, tokens, n=3, cutoff=0.4)
+                        hint = f" Did you mean: {close}?" if close else ""
+                        errors.append(
+                            f"node {label}: parm '{parm_name}': '{value}' is not a menu "
+                            f"item. Items: {tokens[:15]}.{hint}"
+                        )
+                    else:
+                        errors.append(
+                            f"node {label}: parm '{parm_name}' is numeric "
+                            f"({templates[parm_name]}) and will not take the string "
+                            f"{value!r}. To set it as an expression, write "
+                            f'"{parm_name}": {{"expr": {value!r}}} or put it in the '
+                            f"spec's 'expressions' block."
+                        )
                 if (
                     parm_name not in parm_names
                     and parm_name not in tuple_names
@@ -1852,6 +1881,7 @@ def build_network(
     try:
         for spec in nodes:
             node = parent.createNode(resolved_types[spec["type"]].name(), spec.get("name"))
+            apply_tab_defaults(node)
             created[spec.get("name") or node.name()] = node
 
         for spec, node in zip(nodes, created.values(), strict=False):
@@ -2272,7 +2302,9 @@ def _collapse_inherited_errors(children: list, reports: list) -> list:
     return [{"path": p, "errors": original[p]} for p in sorted(root_paths)]
 
 
-def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict:
+def verify_network(
+    parent_path: str, force_cook: bool = False, all_nodes: bool = False, **_: Any
+) -> dict:
     """Inspect every node in a network: the 'middle-click everything' pass.
 
     Cooks the display node, then reports per-node errors/warnings/flags
@@ -2376,8 +2408,13 @@ def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict
         # Named apart from the rest because no scene change fixes it.
         "license_error": licensing,
         "force_cook": bool(force_cook),
-        "nodes": reports,
+        "nodes": reports if all_nodes else [r for r in reports if set(r) - {"path", "type"}],
     }
+    if not all_nodes:
+        # 194 rows of {path, type} said nothing a count does not; the nodes
+        # with something to report (errors, warnings, flags) are what an
+        # agent reads. all_nodes=True restores the full inventory.
+        result["clean_nodes"] = sum(1 for r in reports if not set(r) - {"path", "type"})
     if side_cooked:
         result["cooked_off_display"] = side_cooked
     if unchecked:
@@ -2412,9 +2449,61 @@ _CATEGORY_HELP_DIRS = {
 }
 
 
+def _help_file_stems(type_name: str) -> list[str]:
+    """Help file names Houdini uses for a type: ns::name::1.0 -> ns--name-1.0."""
+    parts = type_name.split("::")
+    if len(parts) > 1 and parts[-1][:1].isdigit():
+        unversioned = "--".join(parts[:-1])
+        return [f"{unversioned}-{parts[-1]}", unversioned]
+    return ["--".join(parts)]
+
+
+def _package_help(node_type, category_name: str) -> str | None:
+    """A package's page for the type (SideFX Labs ships its node help that way)."""
+    from fxhoudinimcp_server.handlers import help_handlers  # noqa: PLC0415
+
+    stems = _help_file_stems(node_type.name())
+    unversioned = stems[-1].lower()
+    for root in help_handlers._extra_help_dirs():
+        for help_dir in _CATEGORY_HELP_DIRS.get(category_name, [category_name.lower()]):
+            folder = os.path.join(root, "nodes", help_dir)
+            if not os.path.isdir(folder):
+                continue
+            files = {name.lower(): name for name in os.listdir(folder) if name.endswith(".txt")}
+            match = next(
+                (files[f"{stem.lower()}.txt"] for stem in stems if f"{stem.lower()}.txt" in files),
+                None,
+            )
+            if match is None:
+                # Another version's page beats none: labs--edge_damage-1.0 for 2.1.
+                others = sorted(name for name in files if name.startswith(unversioned + "-"))
+                match = files[others[-1]] if others else None
+            if match:
+                with open(os.path.join(folder, match), "rb") as handle:
+                    return handle.read().decode("utf-8", "replace")
+    return None
+
+
+def _ships_with_houdini(node_type) -> bool:
+    definition = node_type.definition()
+    if definition is None:
+        return True
+    hfs = os.path.normcase(os.path.normpath(hou.text.expandString("$HFS")))
+    return os.path.normcase(os.path.normpath(definition.libraryFilePath())).startswith(hfs)
+
+
 def _help_text(node_type, category_name: str) -> str | None:
     """Houdini's own help for a node type, version-exact, headless-safe."""
     global _HELP_ZIP_INDEX
+    with contextlib.suppress(Exception):
+        page = _package_help(node_type, category_name)
+        if page:
+            return page
+    # A package asset is never documented by the install's page of the same
+    # base name: labs::filecache would otherwise read the File Cache page.
+    with contextlib.suppress(Exception):
+        if "::" in node_type.name() and not _ships_with_houdini(node_type):
+            return node_type.embeddedHelp() or None
     # hou.text.expandString, not the deprecated hou.expandString.
     zip_path = os.path.join(hou.text.expandString("$HFS"), "houdini", "help", "nodes.zip")
     if _HELP_ZIP_INDEX is None:

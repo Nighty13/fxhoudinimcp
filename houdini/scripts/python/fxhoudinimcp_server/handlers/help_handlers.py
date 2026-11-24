@@ -53,11 +53,41 @@ def _help_dir() -> str:
     return os.path.join(hou.text.expandString("$HFS"), "houdini", "help")
 
 
-def _available_scopes() -> list[str]:
-    """Every documentation corpus the install ships, zipped or loose."""
-    root = _help_dir()
-    if not os.path.isdir(root):
+def _extra_help_dirs() -> list[str]:
+    """The help/ folders of packages on HOUDINI_PATH, after the install's own.
+
+    SideFX Labs ships 449 node pages in $SIDEFXLABS/help/nodes, in the same
+    format as the install's help. Reading $HFS alone, "edge damage" found
+    nothing, so an agent modelling a building never learned that Labs Edge
+    Damage or Labs Building Generator exist. A studio package's help is read
+    the same way.
+    """
+    try:
+        paths = list(hou.houdiniPath())
+    except Exception:
         return []
+    seen = {os.path.normcase(os.path.normpath(_help_dir()))}
+    roots = []
+    for base in paths:
+        if not isinstance(base, str):
+            continue
+        root = os.path.normpath(os.path.join(base, "help"))
+        key = os.path.normcase(root)
+        if key in seen or not os.path.isdir(root):
+            continue
+        seen.add(key)
+        roots.append(root)
+    return roots
+
+
+def _help_roots() -> list[str]:
+    """Every help root, the install's first: its pages win on a name clash."""
+    return [_help_dir(), *_extra_help_dirs()]
+
+
+def _scopes_in(root: str) -> set[str]:
+    if not os.path.isdir(root):
+        return set()
     scopes = set()
     for name in os.listdir(root):
         path = os.path.join(root, name)
@@ -71,6 +101,14 @@ def _available_scopes() -> list[str]:
             and any(file.endswith(".txt") for _, _, files in os.walk(path) for file in files)
         ):
             scopes.add(name)
+    return scopes
+
+
+def _available_scopes() -> list[str]:
+    """Every documentation corpus the install and its packages ship, zipped or loose."""
+    scopes: set[str] = set()
+    for root in _help_roots():
+        scopes |= _scopes_in(root)
     return sorted(scopes)
 
 
@@ -121,15 +159,20 @@ def _read_dir(root: str) -> dict[str, tuple[str, str]]:
 def _load_scope(scope: str) -> dict[str, tuple[str, str]]:
     if scope in _CACHE:
         return _CACHE[scope]
-    root = _help_dir()
-    zip_path = os.path.join(root, f"{scope}.zip")
-    dir_path = os.path.join(root, scope)
-    if os.path.isfile(zip_path):
-        pages = _read_zip(zip_path)
-    elif os.path.isdir(dir_path):
-        pages = _read_dir(dir_path)
-    else:
-        pages = {}
+    pages: dict[str, tuple[str, str]] = {}
+    # A package's nodes/ merges into the install's nodes/: Labs pages are
+    # nodes/sop/labs--edge_damage-2.1, beside nodes/sop/scatter.
+    for root in _help_roots():
+        zip_path = os.path.join(root, f"{scope}.zip")
+        dir_path = os.path.join(root, scope)
+        if os.path.isfile(zip_path):
+            found = _read_zip(zip_path)
+        elif os.path.isdir(dir_path):
+            found = _read_dir(dir_path)
+        else:
+            continue
+        for entry, page in found.items():
+            pages.setdefault(entry, page)
     _CACHE[scope] = pages
     return pages
 

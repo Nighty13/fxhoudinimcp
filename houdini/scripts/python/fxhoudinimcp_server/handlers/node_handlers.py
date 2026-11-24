@@ -58,6 +58,21 @@ def _node_summary(node: hou.Node) -> dict:
 ###### nodes.create_node
 
 
+def apply_tab_defaults(node: hou.Node) -> None:
+    """Give a scripted node what the Tab menu gives it and createNode does not.
+
+    Copy to Points made by createNode has no "Attributes from Target" entries
+    (the Tab tool adds them), so a target point's Cd never reached the copies
+    and nothing said so: a tiled roof came out uncoloured. Its own Reset
+    button writes the three entries the Tab menu does.
+    """
+    with contextlib.suppress(Exception):
+        count = node.parm("targetattribs")
+        button = node.parm("resettargetattribs")
+        if count is not None and button is not None and count.eval() == 0:
+            button.pressButton()
+
+
 def create_node(
     parent_path: str,
     node_type: str,
@@ -82,6 +97,7 @@ def create_node(
         raise ValueError(
             f"Failed to create node of type '{node_type}' inside '{parent_path}': {readable_message(e)}"
         ) from e
+    apply_tab_defaults(node)
 
     if position is not None and len(position) >= 2:
         node.setPosition(hou.Vector2(position[0], position[1]))

@@ -133,7 +133,7 @@ class TestAStaleErrorIsNamed:
         dirty = _Node("/obj/geo1/box1", needs_to_cook=True)
         _network(monkeypatch, dirty)
 
-        result = graph.verify_network("/obj/geo1")
+        result = graph.verify_network("/obj/geo1", all_nodes=True)
 
         assert result["stale_error_nodes"] == []
         assert result["healthy"] is True
@@ -188,7 +188,7 @@ class TestForceCookRejudges:
         clean = _Node("/obj/geo1/box1", needs_to_cook=True)
         _network(monkeypatch, clean)
 
-        result = graph.verify_network("/obj/geo1", force_cook=True)
+        result = graph.verify_network("/obj/geo1", force_cook=True, all_nodes=True)
 
         assert clean.cooks == []
         assert "recooked" not in _row(result, "/obj/geo1/box1")

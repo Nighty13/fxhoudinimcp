@@ -47,18 +47,65 @@ def _record(path: str, what: str) -> None:
         seen.append(what)
 
 
+_FLAG_NAMES = (
+    "isDisplayFlagSet",
+    "isRenderFlagSet",
+    "isBypassed",
+    "isTemplateFlagSet",
+    "isHardLocked",
+)
+# Flags last seen per watched node (session id), refreshed when each call ends.
+_flags: dict[str, tuple] = {}
+
+
+def _flags_of(node: Any) -> tuple:
+    values = []
+    for name in _FLAG_NAMES:
+        try:
+            values.append(bool(getattr(node, name)()))
+        except Exception:
+            values.append(None)
+    return tuple(values)
+
+
+def _driven(parm_tuple: Any) -> bool:
+    """A parm whose value an expression or channel sets: cooks change it, not people.
+
+    A for-each loop re-evaluates prim('../face_n', 0, 'N', 0) on every pass,
+    and each pass fired ParmTupleChanged: 72 "edits" were reported after one
+    cook nobody touched.
+    """
+    with contextlib.suppress(Exception):
+        return any(len(parm.keyframes()) > 0 for parm in parm_tuple)
+    return False
+
+
 def _on_event(event_type: Any = None, **kwargs: Any) -> None:
     """Houdini node event callback. Ignores everything inside an MCP call."""
     if _depth > 0:
         return
     with contextlib.suppress(Exception):
         node = kwargs.get("node")
+        # A locked asset's internals change when the asset cooks
+        # (attribrandomize's own switch1), never by hand.
+        if node.isInsideLockedHDA() is True:
+            return
         path = node.path()
         name = getattr(event_type, "name", lambda: str(event_type))()
         if name == "ParmTupleChanged":
             parm_tuple = kwargs.get("parm_tuple")
+            if parm_tuple is not None and _driven(parm_tuple):
+                return
             _record(path, f"parm {parm_tuple.name()}" if parm_tuple is not None else "parms")
         elif name == "FlagChanged":
+            # The event also fires for selection and current-node changes and
+            # for display flags an MCP call set (delivered after it ended):
+            # only a real flag that differs from what the last call left is an edit.
+            key = str(node.sessionId())
+            now = _flags_of(node)
+            if _flags.get(key) == now:
+                return
+            _flags[key] = now
             _record(path, "flags")
         elif name == "ChildCreated":
             _record(path, f"+{kwargs['child_node'].name()}")
@@ -77,6 +124,7 @@ def _watch(node: Any) -> None:
             return
         node.addEventCallback(_event_types(), _on_event)
         _watched.add(key)
+        _flags[key] = _flags_of(node)
 
 
 def _paths_in(params: dict[str, Any]) -> list[str]:
@@ -100,6 +148,15 @@ def end_call(params: dict[str, Any]) -> None:
     _depth = max(0, _depth - 1)
     if _depth:
         return
+    # What this call did to flags (a display flag moves off a sibling too) is
+    # the new baseline, so the deferred FlagChanged it causes is not an edit.
+    for key in list(_flags):
+        with contextlib.suppress(Exception):
+            node = hou.nodeBySessionId(int(key))
+            if node is None:
+                _flags.pop(key, None)
+            else:
+                _flags[key] = _flags_of(node)
     for path in _paths_in(params):
         with contextlib.suppress(Exception):
             node = hou.node(path)

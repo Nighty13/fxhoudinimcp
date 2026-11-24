@@ -400,7 +400,7 @@ class TestEvidenceTools:
         await verify_network(mock_ctx, parent_path="/obj/geo1")
         mock_bridge.execute.assert_called_once_with(
             "graph.verify_network",
-            {"parent_path": "/obj/geo1", "force_cook": False},
+            {"parent_path": "/obj/geo1", "force_cook": False, "all_nodes": False},
         )
 
     @pytest.mark.asyncio
@@ -411,7 +411,7 @@ class TestEvidenceTools:
         await verify_network(mock_ctx, parent_path="/obj/geo1", force_cook=True)
         mock_bridge.execute.assert_called_once_with(
             "graph.verify_network",
-            {"parent_path": "/obj/geo1", "force_cook": True},
+            {"parent_path": "/obj/geo1", "force_cook": True, "all_nodes": False},
         )
 
 

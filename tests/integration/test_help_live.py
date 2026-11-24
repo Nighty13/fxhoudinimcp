@@ -75,6 +75,8 @@ class TestStrippedBuildDegradation:
         from fxhoudinimcp_server.handlers import help_handlers
 
         monkeypatch.setattr(help_handlers, "_help_dir", lambda: str(tmp_path / "no_help_here"))
+        # Package help (SideFX Labs) would still answer: a stripped build has none.
+        monkeypatch.setattr(help_handlers, "_extra_help_dirs", lambda: [])
         with pytest.raises(hou.OperationFailed) as excinfo:
             help_handlers.search_help(query="anything")
         message = str(excinfo.value)
