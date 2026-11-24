@@ -5,9 +5,17 @@ from __future__ import annotations
 # Built-in
 from typing import Any
 
+# Internal
+from fxhoudinimcp._sdk import ToolError
 
-class FXHoudiniError(Exception):
-    """Base exception for all FXHoudini-MCP errors."""
+
+class FXHoudiniError(ToolError):
+    """Base exception for all FXHoudini-MCP errors.
+
+    A ToolError, so the MCP SDK hands its message to the model: mcp 2.x
+    reduces any other exception to "Error executing tool <name>" and the
+    handler's explanation (valid sections, the bad op) was lost.
+    """
 
     def __init__(
         self,

@@ -20,7 +20,13 @@ from contextlib import asynccontextmanager
 from fxhoudinimcp._loader import load_markdown
 
 # Third-party
-from fxhoudinimcp._sdk import Server, build_server, forbid_unknown_arguments, report_progress
+from fxhoudinimcp._sdk import (
+    Server,
+    build_server,
+    forbid_unknown_arguments,
+    report_progress,
+    tool_error_from,
+)
 from fxhoudinimcp._version import __version__
 
 # Internal
@@ -214,6 +220,10 @@ def _trim(value):
     eighteen characters, nine of them noise the geometry never stored.
     """
     if isinstance(value, float):
+        # Past a million a value is not geometry: an epoch mtime cut to 7
+        # digits read the same on two saves minutes apart (1795525000.0).
+        if abs(value) >= 1e6:
+            return round(value, 3)
         return float(f"{value:.7g}")
     if isinstance(value, dict):
         return {key: _trim(item) for key, item in value.items()}
@@ -245,7 +255,13 @@ def _compact_tool(*args, **kwargs):
     def decorator(function):
         @functools.wraps(function)
         async def compact(*call_args, **call_kwargs):
-            result = await function(*call_args, **call_kwargs)
+            try:
+                result = await function(*call_args, **call_kwargs)
+            except Exception as exc:
+                converted = tool_error_from(exc)
+                if converted is exc:
+                    raise
+                raise converted from exc
             return compact_json(result) if isinstance(result, dict) else result
 
         # Resolved against the tool's own module: inspect.signature follows

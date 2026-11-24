@@ -38,7 +38,10 @@ previous shaping.
 - Masks drive parameters, so build the mask deliberately and visualise it. heightfield_visualize exists because a mask you cannot see is a mask you cannot debug.
 - heightfield_maskbyfeature (slope, height, curvature) is how you get masks that follow the terrain rather than hand-painting. Paint is for art direction, not for structure.
 - Scattering onto terrain reads the layers, so scatter after shaping and masking, not before.
+- heightfield_scatter copies every layer onto the scatter points as point attributes, and its coverage treats any mask value above 0 as fully inside: cull by the mask value afterwards for soft clustering, and attribdelete the inherited layers before output.
+- **A feature narrower than ~2 cells cannot be stamped.** Check the cell size (`get_volume_info` voxel size) against the smallest road, bank or step first; at 3.9 m cells a 1 m step is unresolvable, and the "bug" is the sampling limit.
 - heightfield_output exports layers to image files (16-bit PNG/EXR for a game-engine heightmap); convertheightfield turns a heightfield into polygons. Terrain stays a heightfield for as long as possible, because layers are lost on the way out.
+- For an Unreal Landscape (sizes, Z scale, paint layers) read `get_workflow_guide("unreal_landscape")`; for rivers and roads carved from curves, `get_workflow_guide("roads_rivers")`.
 
 ## Order of work
 

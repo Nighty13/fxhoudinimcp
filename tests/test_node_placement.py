@@ -425,6 +425,10 @@ _PLACEMENT_EXEMPT = {
     ("_dry_run_in_scratch", "above"),
     # Probe for multiparm instance menus during validation, destroyed at once.
     ("_instance_menu_errors", "scratch"),
+    # build_network dry run: one probe wrangle per snippet, compiled and destroyed.
+    ("_dry_run_vex", "parent"),
+    # Capture scratch nodes (object merge, blast, visualize), destroyed in the same call.
+    ("scratch_child", "parent"),
     # Same idea for the node card's connector probe: a throwaway container
     # under /obj, destroyed in the same call.
     ("_connectors_for_type", "root"),

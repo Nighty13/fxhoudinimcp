@@ -34,7 +34,11 @@ from fxhoudinimcp_server.config import (
 )
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
-from fxhoudinimcp_server.handlers.dop_handlers import dop_cache_note
+from fxhoudinimcp_server.handlers.dop_handlers import (
+    dop_cache_note,
+    reset_parm,
+    simulations_upstream,
+)
 from fxhoudinimcp_server.handlers.node_handlers import (
     _find_input,
     _find_output,
@@ -624,6 +628,12 @@ def _vop_signatures(node_type) -> list[dict[str, Any]]:
     return signatures
 
 
+def _is_multiparm_template(template: Any) -> bool:
+    with contextlib.suppress(Exception):
+        return "Multiparm" in template.folderType().name()
+    return False
+
+
 def _parm_names_for_type(
     scratch: hou.Node,
     node_type,
@@ -675,7 +685,12 @@ def _parm_names_for_type(
     if parm_types is not None:
         for parm in probe.parms():
             with contextlib.suppress(Exception):
-                parm_types[parm.name()] = parm.parmTemplate().type().name()
+                template = parm.parmTemplate()
+                kind = template.type().name()
+                if kind == "Folder" and _is_multiparm_template(template):
+                    # The count of a multiparm block: a value, unlike a tab folder.
+                    kind = "Multiparm"
+                parm_types[parm.name()] = kind
     if factory_expressions is not None:
         for parm_tuple in probe.parmTuples():
             found = {
@@ -789,6 +804,12 @@ _SPEC_KEYS = frozenset(
         "position",
         "override_expression",
         "run_callbacks",
+        # Splice into an existing wire: {"insert_after": "nodeX"} wires this
+        # node from nodeX (when it names no inputs) and moves every existing
+        # reader of nodeX onto this node, or onto the spec named by
+        # "insert_output" (the end of an inserted chain).
+        "insert_after",
+        "insert_output",
     }
 )
 
@@ -1412,6 +1433,19 @@ def build_network(
         for key in spec:
             if key not in _SPEC_KEYS:
                 errors.append(_unknown_key_error(label, "spec", key, _SPEC_KEYS))
+        if spec.get("insert_after") is not None:
+            target = str(spec["insert_after"])
+            if parent.node(target) is None:
+                errors.append(
+                    f"node {label}: insert_after '{target}' is not an existing child of "
+                    f"{parent_path} (insert after a node that is already built)"
+                )
+            end = spec.get("insert_output")
+            names = {s.get("name") for s in nodes if isinstance(s, dict)}
+            if end is not None and end not in names:
+                errors.append(f"node {label}: insert_output '{end}' is not a spec name")
+        elif spec.get("insert_output") is not None:
+            errors.append(f"node {label}: insert_output only goes with insert_after")
         position = spec.get("position")
         if position is not None and not _is_xy(position):
             errors.append(
@@ -1574,7 +1608,26 @@ def build_network(
         if knowledge:
             parm_names, tuple_names, menus, instance_patterns, _ = knowledge
             templates = template_knowledge.get(spec.get("type")) or {}
+            # A folder (a multiparm block's instance folder too: scatter1 on
+            # rbdmaterialfracture) took an expression and did nothing; the
+            # count the caller meant lives in a parm inside it.
+            for parm_name in sorted(set(spec.get("parms") or {}) | set(_spec_expressions(spec))):
+                if templates.get(parm_name) in ("Folder", "FolderSet"):
+                    inside = (
+                        sorted(
+                            p for p in parm_names if p != parm_name and p.endswith(parm_name[-1:])
+                        )[:6]
+                        if parm_name[-1:].isdigit()
+                        else []
+                    )
+                    hint = f" Parms of that instance include {inside}." if inside else ""
+                    errors.append(
+                        f"node {label}: '{parm_name}' is a folder, not a value; write the "
+                        f"parm inside it instead.{hint}"
+                    )
             for parm_name in _spec_expressions(spec):
+                if templates.get(parm_name) in ("Folder", "FolderSet"):
+                    continue
                 if parm_name in parm_names or _is_instance_parm(parm_name, instance_patterns):
                     continue
                 if parm_name in tuple_names:
@@ -1590,6 +1643,8 @@ def build_network(
                 hint = f" Did you mean: {close}?" if close else ""
                 errors.append(f"node {label}: no parm '{parm_name}' to put an expression on.{hint}")
             for parm_name, value in (spec.get("parms") or {}).items():
+                if templates.get(parm_name) in ("Folder", "FolderSet"):
+                    continue
                 if isinstance(value, (list, tuple)):
                     for position, component in enumerate(value):
                         try:
@@ -1741,6 +1796,12 @@ def build_network(
                     except ValueError as exc:
                         errors.append(f"node {label}: input source '{source}' {exc}")
 
+    # A dry run compiles every snippet the spec carries: an ambiguous
+    # overload used to pass validation and cost a build + verify round each.
+    if dry_run and not errors:
+        for label, found in _dry_run_vex(parent, resolved_types, nodes).items():
+            errors.extend(f"node {label}: VEX: {message}" for message in found)
+
     if errors:
         reply: dict[str, Any] = {
             "success": False,
@@ -1776,6 +1837,18 @@ def build_network(
     flags_not_applied: dict[str, list[str]] = {}
     positioned: set[str] = set()
     display_moved: dict[str, str] = {}
+    # insert_after: each target's readers, read before anything is wired.
+    readers: dict[str, list[tuple[Any, int, int]]] = {}
+    for spec in nodes:
+        target_name = spec.get("insert_after")
+        if target_name is not None and str(target_name) not in readers:
+            target = parent.node(str(target_name))
+            readers[str(target_name)] = [
+                (conn.outputNode(), conn.inputIndex(), conn.outputIndex())
+                for conn in target.outputConnections()
+            ]
+    inserted: dict[str, dict[str, Any]] = {}
+    rewired_back: list[tuple[Any, int, Any, int]] = []
     try:
         for spec in nodes:
             node = parent.createNode(resolved_types[spec["type"]].name(), spec.get("name"))
@@ -1866,7 +1939,30 @@ def build_network(
                 # Untagged, a node asked at (0, 0) looks unplaced and gets moved.
                 mark_placed(node)
                 positioned.add(node.path())
+
+        # insert_after last, once every spec node is wired: two calls (a
+        # build, then connect_nodes with remembered input indices) per
+        # insertion before.
+        for spec, node in zip(nodes, created.values(), strict=False):
+            target_name = spec.get("insert_after")
+            if target_name is None:
+                continue
+            target = parent.node(str(target_name))
+            if not spec.get("inputs"):
+                node.setInput(0, target, 0)
+            end = created.get(spec.get("insert_output")) or node
+            moved = []
+            for reader, input_index, output_index in readers.get(str(target_name), []):
+                if reader.path() in {n.path() for n in created.values()}:
+                    continue
+                rewired_back.append((reader, input_index, target, output_index))
+                reader.setInput(input_index, end, 0)
+                moved.append(f"{reader.name()}[{input_index}]")
+            inserted[node.name()] = {"after": target.name(), "output": end.name(), "rewired": moved}
     except Exception as exc:
+        for reader, input_index, target, output_index in rewired_back:
+            with contextlib.suppress(Exception):
+                reader.setInput(input_index, target, output_index)
         for node in created.values():
             with contextlib.suppress(Exception):
                 node.destroy()
@@ -1909,6 +2005,10 @@ def build_network(
         display = list(created.values())[-1]
     with contextlib.suppress(hou.OperationFailed):
         display.cook(force=False)
+    # Wrangles and branch ends off the display chain never cooked, so their
+    # VEX never compiled and they read clean (two broken wrangles on a
+    # water branch, 4e #1).
+    side_cooked = _cook_side_branches(list(created.values()))
 
     reports = [_node_report(node) for node in created.values()]
     for report in reports:
@@ -1929,6 +2029,10 @@ def build_network(
         "error_nodes": error_nodes,
         "node_count": len(reports),
     }
+    if side_cooked:
+        result["cooked_off_display"] = side_cooked
+    if inserted:
+        result["inserted"] = inserted
     if flags_not_applied:
         result["flags_not_applied"] = flags_not_applied
     if display_moved:
@@ -1978,6 +2082,127 @@ def build_network(
     return result
 
 
+###### VEX compile and side-branch cooking (build_network, verify_network)
+
+# Errors a lone probe wrangle raises because it has no inputs, not because
+# its code is wrong.
+_INPUT_NOISE = ("not enough sources",)
+
+# Types never cooked just to look for errors: a cook can simulate or write.
+_NO_SIDE_COOK = ("dopnet", "filecache", "rop_", "solver", "vellum", "flipsolver", "pyrosolver")
+
+
+def _has_snippet(node: Any) -> bool:
+    with contextlib.suppress(Exception):
+        return node.parm("snippet") is not None
+    return False
+
+
+def _is_branch_end(node: Any, among: list) -> bool:
+    """No outputs, or none among *among* (the end of a branch someone built)."""
+    with contextlib.suppress(Exception):
+        outputs = list(node.outputs())
+        if not outputs:
+            return True
+        paths = {n.path() for n in among}
+        return not any(o.path() in paths for o in outputs)
+    return False
+
+
+def _side_cook_allowed(node: Any) -> bool:
+    with contextlib.suppress(Exception):
+        name = node.type().name().lower()
+        return not any(token in name for token in _NO_SIDE_COOK)
+    return False
+
+
+def _block_ends(nodes: list) -> list:
+    """For-each / compile block ends among *nodes*: cooking one runs its body."""
+    found = []
+    for node in nodes:
+        with contextlib.suppress(Exception):
+            if "block_end" in node.type().name():
+                found.append(node)
+    return found
+
+
+def _cook_side_branches(nodes: list) -> list[str]:
+    """Cook wrangles and branch ends that are still uncooked; return their paths.
+
+    The display cook only reaches the display chain. A wrangle on a side
+    branch never compiled, so a VEX error there read as healthy. Sims, caches
+    and ROPs are left alone: cooking one can simulate or write.
+    """
+    cooked = []
+    blocks = {id(n) for n in _block_ends(nodes)}
+    for node in nodes:
+        if not (_has_snippet(node) or id(node) in blocks or _is_branch_end(node, nodes)):
+            continue
+        if not _side_cook_allowed(node) or not _needs_to_cook(node):
+            continue
+        with contextlib.suppress(Exception):
+            node.cook(force=False)
+        cooked.append(node.path())
+    return cooked
+
+
+def _compile_errors(node: Any) -> list[str]:
+    """The node's errors minus the ones a missing input causes."""
+    found = []
+    with contextlib.suppress(Exception):
+        found = [_condensed(e) for e in node.errors() or []]
+    return [e for e in found if not any(noise in e.lower() for noise in _INPUT_NOISE)]
+
+
+def _dry_run_vex(parent: Any, resolved_types: dict, nodes: list) -> dict[str, list[str]]:
+    """Compile each spec's `snippet` on a probe of its type; {label: errors}.
+
+    The probe gets the spec's `class` (run over) and snippet only, cooks, and
+    is destroyed; the parent's display/render flags are put back.
+    """
+    found: dict[str, list[str]] = {}
+    targets = []
+    for index, spec in enumerate(nodes):
+        if not isinstance(spec, dict):
+            continue
+        snippet = (spec.get("parms") or {}).get("snippet")
+        node_type = resolved_types.get(spec.get("type"))
+        if isinstance(snippet, str) and snippet.strip() and node_type is not None:
+            targets.append((spec.get("name") or spec.get("type") or f"#{index}", spec, node_type))
+    if not targets:
+        return found
+    display_before = parent.displayNode() if hasattr(parent, "displayNode") else None
+    render_before = parent.renderNode() if hasattr(parent, "renderNode") else None
+    try:
+        for label, spec, node_type in targets:
+            probe = None
+            try:
+                probe = parent.createNode(node_type.name())
+                run_over = (spec.get("parms") or {}).get("class")
+                if run_over is not None and probe.parm("class") is not None:
+                    with contextlib.suppress(Exception):
+                        probe.parm("class").set(run_over)
+                probe.parm("snippet").set(spec["parms"]["snippet"])
+                with contextlib.suppress(Exception):
+                    probe.cook(force=True)
+                errors = _compile_errors(probe)
+                if errors:
+                    found[label] = errors
+            except Exception:  # noqa: BLE001 - a probe that cannot be made is not a VEX verdict
+                continue
+            finally:
+                if probe is not None:
+                    with contextlib.suppress(Exception):
+                        probe.destroy()
+    finally:
+        with contextlib.suppress(Exception):
+            if display_before is not None:
+                display_before.setDisplayFlag(True)
+            if render_before is not None:
+                render_before.setRenderFlag(True)
+    return found
+
+
 ###### graph.verify_network
 
 
@@ -1994,9 +2219,11 @@ def _has_errors(node: hou.Node) -> bool:
 
 
 def _filter_matches(parm_filter: str, *texts: str) -> bool:
-    """Case-insensitive substring match; `a|b|c` matches any of the alternatives."""
-    terms = [t.strip().lower() for t in parm_filter.split("|") if t.strip()]
-    return any(term in text.lower() for term in terms for text in texts)
+    """The shared parm-filter rule (parm_patterns): substring, `a|b`
+    alternatives, and globs (`qa_*`) matched against the whole text."""
+    from fxhoudinimcp_server import parm_patterns
+
+    return parm_patterns.matches(parm_filter, *texts)
 
 
 def _inherited(errors: list) -> bool:
@@ -2065,6 +2292,12 @@ def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict
     node dirty, and only a forced cook of that node clears it. The default
     cooks the display node only, as before, so a heavy scene is not
     recooked without being asked.
+
+    The display cook never reaches side branches. With `force_cook`, every
+    wrangle, for-each block end and branch end that still needs a cook is
+    cooked too (sims, caches and ROPs excluded), listed in
+    `cooked_off_display`. Without it, such nodes are listed in `never_cooked`
+    and the network is not called healthy: their VEX never compiled.
     """
     parent = hou.node(parent_path)
     if parent is None:
@@ -2085,9 +2318,16 @@ def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict
     # Recook before any report is taken: a recook cooks the node's inputs
     # too, so a report taken earlier in the same loop could be out of date.
     recooked = set()
+    side_cooked: list[str] = []
     if force_cook:
+        # Read before the side cook clears some: those still get the forced
+        # recook below and are reported `recooked`.
+        had_errors = {child.path() for child in children if _has_errors(child)}
+        # Side branches (water, falls, extra outputs), for-each block ends and
+        # wrangles off the display chain: cooked so their errors exist at all.
+        side_cooked = _cook_side_branches(children)
         for child in children:
-            if _has_errors(child):
+            if child.path() in had_errors or _has_errors(child):
                 with contextlib.suppress(hou.OperationFailed):
                     child.cook(force=True)
                 recooked.add(child.path())
@@ -2110,6 +2350,20 @@ def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict
     error_nodes = [r["path"] for r in reports if r.get("errors")]
     licensing = license_error([e for r in reports for e in r.get("errors", ())])
     root_errors = _collapse_inherited_errors(children, reports)
+    # Without force_cook, a wrangle or branch end that never cooked has no
+    # errors to report; it is named instead of being counted as healthy.
+    unchecked = (
+        []
+        if force_cook
+        else [
+            c.path()
+            for c in children
+            if (_has_snippet(c) or _is_branch_end(c, children))
+            and c is not display
+            and _needs_to_cook(c)
+            and c.path() not in error_nodes
+        ]
+    )
     result = {
         "parent_path": parent_path,
         "node_count": len(reports),
@@ -2118,12 +2372,20 @@ def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict
         "error_nodes": error_nodes,
         "root_errors": root_errors,
         "stale_error_nodes": stale_nodes,
-        "healthy": not error_nodes,
+        "healthy": not error_nodes and not unchecked,
         # Named apart from the rest because no scene change fixes it.
         "license_error": licensing,
         "force_cook": bool(force_cook),
         "nodes": reports,
     }
+    if side_cooked:
+        result["cooked_off_display"] = side_cooked
+    if unchecked:
+        result["never_cooked"] = unchecked
+        result["never_cooked_note"] = (
+            f"{len(unchecked)} wrangle(s)/branch end(s) off the display chain have not "
+            f"cooked, so their errors are unknown. verify_network(force_cook=True) cooks them."
+        )
     if stale_nodes:
         result["note"] = (
             "Errors on stale nodes are from a cook that predates their last change; "
@@ -2184,6 +2446,37 @@ def _help_text(node_type, category_name: str) -> str | None:
     return embedded or None
 
 
+_HELP_SUMMARY_CHARS = 1500
+
+
+def _help_summary(text: str) -> tuple[str, list[str]]:
+    """The help up to its first section, capped, and the section names.
+
+    Houdini help is wiki text: `= Title =`, a summary, then `@parameters`,
+    `== Heading ==` sections. The summary is everything before the first
+    section marker.
+    """
+    sections: list[str] = []
+    head: list[str] = []
+    in_head = True
+    for line in text.splitlines():
+        stripped = line.strip()
+        is_section = stripped.startswith("@") or (
+            stripped.startswith("==") and stripped.endswith("==")
+        )
+        if is_section:
+            in_head = False
+            name = stripped.strip("=@ ").strip()
+            if name and name not in sections:
+                sections.append(name)
+        elif in_head:
+            head.append(line)
+    summary = "\n".join(head).strip()
+    if len(summary) > _HELP_SUMMARY_CHARS:
+        summary = summary[:_HELP_SUMMARY_CHARS] + "\n[... summary truncated]"
+    return summary, sections[:40]
+
+
 def get_node_card(
     node_type: str,
     context: str = "Sop",
@@ -2225,8 +2518,10 @@ def get_node_card(
     added_on_create = _on_created_templates(context, resolved)
     added_names = {template.name() for template in added_on_create}
     signatures = _vop_signatures(resolved) if context == "Vop" else []
+    total_parms = 0
     for template in [*resolved.parmTemplateGroup().entriesWithoutFolders(), *added_on_create]:
         name, label = template.name(), template.label()
+        total_parms += 1
         if parm_filter and not _filter_matches(parm_filter, name, label):
             continue
         matched += 1
@@ -2342,6 +2637,7 @@ def get_node_card(
         if found.get("folder_set") is None:
             continue
         labels = found.get("labels") or []
+        total_parms += 1
         if parm_filter and not _filter_matches(parm_filter, name, *labels):
             continue
         matched += 1
@@ -2399,7 +2695,13 @@ def get_node_card(
     _collect_multiparms(resolved.parmTemplateGroup().entries())
 
     help_text = _help_text(resolved, context) if include_help else None
-    if help_text and len(help_text) > 5000:
+    help_sections: list[str] = []
+    if help_text and str(include_help).lower() != "full":
+        # One card with the whole help was 12.5k chars; the summary and the
+        # section names decide whether to read more (include_help="full", or
+        # get_help_page with a section).
+        help_text, help_sections = _help_summary(help_text)
+    elif help_text and len(help_text) > 5000:
         help_text = help_text[:5000] + "\n[... help truncated]"
 
     card = {
@@ -2411,8 +2713,11 @@ def get_node_card(
         "max_outputs": resolved.maxNumOutputs(),
         "connectors_probed": connectors is not None,
         "is_generator": resolved.minNumInputs() == 0,
-        "parm_count": len(parms),
+        # parm_count is the type's, parms_listed what this card shows: "85
+        # matched of 80" read as a counting bug when 80 was the cap.
+        "parm_count": total_parms,
         "parms_matched": matched,
+        "parms_listed": len(parms),
         # Capped: 274 names (5.6 KB) on a Pyro Solver card filtered to a few.
         "parms_omitted": omitted[:50],
         **({"parms_omitted_count": len(omitted)} if len(omitted) > 50 else {}),
@@ -2431,6 +2736,12 @@ def get_node_card(
         )
     if help_text is not None:
         card["help"] = help_text
+    if help_sections:
+        card["help_sections"] = help_sections
+        card["help_note"] = (
+            "Help summary only. include_help='full' for the text, or "
+            "get_help_page(path='nodes/<context>/<type>', section=...) for one section."
+        )
     if connectors is not None:
         card["inputs"] = connectors["inputs"]
         card["outputs"] = connectors["outputs"]
@@ -2635,6 +2946,7 @@ def cook_frame_range(
     step: float = 1.0,
     attribs: list[str] | str | None = None,
     volumes: bool = False,
+    reset: bool = False,
     **_: Any,
 ) -> dict[str, Any]:
     """Cook a node frame by frame and report what changed on each frame.
@@ -2683,6 +2995,14 @@ def cook_frame_range(
 
     if isinstance(attribs, str):
         attribs = [attribs]
+
+    reset_owners: list[str] = []
+    if reset:
+        # A stale cache gave identical numbers after a change (notes 4d #3).
+        for owner in simulations_upstream(node):
+            with contextlib.suppress(Exception):
+                reset_parm(owner).pressButton()
+                reset_owners.append(owner.path())
 
     frames: list[dict[str, Any]] = []
     total_ms = 0.0
@@ -2763,6 +3083,8 @@ def cook_frame_range(
         "current_frame": hou.frame(),
         "frames": shown,
     }
+    if reset:
+        result["reset_simulations"] = reset_owners
     if interrupted_at is not None:
         result["interrupted"] = True
         result["interrupted_at_frame"] = interrupted_at

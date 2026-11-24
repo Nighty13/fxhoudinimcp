@@ -41,6 +41,27 @@ _SIM_ALIASES = {
     "snow": "mpm",
 }
 
+# Topics that are not sims but are asked for by another name. Kept apart from
+# _SIM_ALIASES so simulation_setup("road") does not hand back a river guide.
+_GUIDE_ALIASES = {
+    "ue": "unreal_landscape",
+    "ue5": "unreal_landscape",
+    "unreal": "unreal_landscape",
+    "landscape": "unreal_landscape",
+    "unreal_engine": "unreal_landscape",
+    "game": "game_assets",
+    "game_asset": "game_assets",
+    "gameassets": "game_assets",
+    "houdini_engine": "game_assets",
+    "vertex_animation": "vat",
+    "vertex_animation_textures": "vat",
+    "river": "roads_rivers",
+    "rivers": "roads_rivers",
+    "road": "roads_rivers",
+    "roads": "roads_rivers",
+    "qa": "mesh_qa",
+}
+
 
 @mcp.prompt()
 def procedural_modeling_workflow(
@@ -175,7 +196,7 @@ def workflow_guide_text(topic: str, description: str = "") -> str:
     Sim aliases ("flip", "rbd", "smoke") resolve to the corpus that documents
     them, exactly as simulation_setup does, so one lookup serves both.
     """
-    key = topic.strip().lower().replace("/", "")
+    key = topic.strip().lower().replace("/", "").replace("-", "_").replace(" ", "_")
     if key == "discipline":
         # The full working rules. The server instructions are a summary of
         # them, because the client shows a server about 2 KB of instructions.
@@ -183,7 +204,7 @@ def workflow_guide_text(topic: str, description: str = "") -> str:
     # A subject with its own file wins over the sim alias table: "ocean" is
     # both a guide and an alias for fluid, and the guide is what was asked for.
     if not markdown_exists(f"workflows/{key}.md"):
-        key = _SIM_ALIASES.get(key, key)
+        key = _GUIDE_ALIASES.get(key) or _SIM_ALIASES.get(key, key)
     candidate = f"workflows/{key}.md"
     if not markdown_exists(candidate):
         available = sorted(path.stem for path in (_MD_DIR / "workflows").glob("*.md"))
@@ -216,9 +237,11 @@ def houdini_workflow(
     markdown file and nothing else. `topic` is the SideFX help scope name, which
     is also the markdown filename: character, render, shade, crowds, copy, props,
     dopparticles, io, anim, ocean, grains, muscles, finiteelements, feathers,
-    fur, ml, composite, heightfields_cop, plus every subject that has its own
-    named prompt (pyro, fluid, vellum, destruction, mpm, solaris, tops, model,
-    assets, copernicus, heightfields, dyno, troubleshooting).
+    fur, ml, composite, heightfields_cop, the game-engine guides
+    (unreal_landscape, game_assets, vat, niagara, roads_rivers, mesh_qa), plus
+    every subject that has its own named prompt (pyro, fluid, vellum,
+    destruction, mpm, solaris, tops, model, assets, copernicus, heightfields,
+    dyno, troubleshooting).
 
     Args:
         topic: Help scope name for the subject, e.g. "character" or "render"

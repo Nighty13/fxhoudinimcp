@@ -10,6 +10,7 @@ from __future__ import annotations
 # Built-in
 import contextlib
 import logging
+import math
 import os
 
 # Third-party
@@ -89,8 +90,8 @@ def _grab_native_surface(rect):
     return pixmap
 
 
-def _capture_pane_tab_qt(pane_tab, output_path: str) -> None:
-    """Capture a pane tab screenshot via Qt.
+def _capture_pane_tab_qt(pane_tab, output_path: str, max_size: int | None = None) -> None:
+    """Capture a pane tab screenshot via Qt, scaled down to *max_size* if larger.
 
     Houdini 20.x exposed PaneTab.qtParentWidget(); Houdini 21 removed it
     in favor of qtParentWindow()/qtScreenGeometry(), so fall back to
@@ -151,6 +152,20 @@ def _capture_pane_tab_qt(pane_tab, output_path: str) -> None:
             f"Cannot capture pane '{pane_tab.name()}': no Qt capture API "
             f"available in this Houdini build."
         )
+
+    if max_size:
+        fitted = _fit_size(pixmap.width(), pixmap.height(), max_size)
+        if fitted != (pixmap.width(), pixmap.height()):
+            try:
+                from PySide6 import QtCore
+            except ImportError:
+                from PySide2 import QtCore
+            pixmap = pixmap.scaled(
+                fitted[0],
+                fitted[1],
+                QtCore.Qt.IgnoreAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            )
 
     if not pixmap.save(output_path):
         raise RuntimeError(
@@ -579,18 +594,98 @@ def _looked_through(viewport) -> tuple[str | None, bool]:
     return path, path is not None
 
 
+#: Direction names -> hou.geometryViewportType attribute names.
+_DIRECTION_TYPES = {
+    "front": "Front",
+    "back": "Back",
+    "top": "Top",
+    "bottom": "Bottom",
+    "left": "Left",
+    "right": "Right",
+    "perspective": "Perspective",
+}
+#: Short spellings agents reach for. "persp" was refused (4b #11).
+_DIRECTION_ALIASES = {"persp": "perspective", "3d": "perspective"}
+#: The same directions as [rx, ry] of a perspective view looking from that side
+#: (a cam object's convention: r=0 looks down -Z from the front). Used where a
+#: direction frames bounds in perspective: frame_all(direction=), sheet views.
+_DIRECTION_ANGLES = {
+    "front": (0.0, 0.0),
+    "back": (0.0, 180.0),
+    "right": (0.0, 90.0),
+    "left": (0.0, -90.0),
+    "top": (-90.0, 0.0),
+    "bottom": (90.0, 0.0),
+    "perspective": (-30.0, 45.0),
+}
+
+
+def _direction_name(direction) -> str | None:
+    """The canonical direction name for *direction*, aliases resolved, or None."""
+    name = str(direction).strip().lower()
+    name = _DIRECTION_ALIASES.get(name, name)
+    return name if name in _DIRECTION_TYPES else None
+
+
+def _unknown_direction(direction) -> ValueError:
+    return ValueError(
+        f"Unknown direction '{direction}'. Supported: {list(_DIRECTION_TYPES)} "
+        f"(also {sorted(_DIRECTION_ALIASES)}), or [rx, ry] degrees for a perspective view "
+        "framing the scene from that angle."
+    )
+
+
+def _angles(value, name: str) -> tuple:
+    """[rx, ry] or [rx, ry, rz] degrees as a 3-tuple, or a ValueError naming *name*."""
+    if isinstance(value, str):
+        canonical = _direction_name(value)
+        if canonical is None:
+            raise _unknown_direction(value)
+        return (*_DIRECTION_ANGLES[canonical], 0.0)
+    try:
+        numbers = tuple(float(v) for v in value)
+    except (TypeError, ValueError):
+        numbers = ()
+    if len(numbers) not in (2, 3) or any(isinstance(v, bool) for v in value):
+        raise ValueError(f"{name} must be [rx, ry] or [rx, ry, rz] degrees, got {value!r}")
+    return numbers if len(numbers) == 3 else (*numbers, 0.0)
+
+
+def _positive(value, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    if isinstance(value, bool) or not number > 0:
+        raise ValueError(f"{name} must be a positive number, got {value!r}")
+    return number
+
+
+def _number(value, name: str) -> float:
+    try:
+        if isinstance(value, bool):
+            raise TypeError
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number, got {value!r}") from None
+
+
 def set_viewport_direction(
-    direction: str = None,
+    direction=None,
     pane_name: str = None,
     rotation: list = None,
     pivot: list = None,
     distance: float = None,
+    look_at: list = None,
+    clearance: float = None,
 ) -> dict:
     """Set the viewport to a standard viewing direction, or place the free view.
 
     Args:
         direction: One of 'front', 'back', 'top', 'bottom', 'left', 'right',
-            'perspective'.
+            'perspective' ('persp' too), or [rx, ry] degrees: a perspective
+            view that frames the scene from that angle, its distance worked
+            out from the bounds and the field of view.
         pane_name: Optional pane tab name.
         rotation: [rx, ry, rz] in degrees: the free view's rotation about its
             pivot.
@@ -598,42 +693,47 @@ def set_viewport_direction(
         distance: How far the free view sits from its pivot along its view
             axis (the dolly). A sideways pan is kept and not counted, so with
             a panned view the eye is farther from the pivot than this.
+        look_at: [x, y, z] to aim a perspective view at; the distance frames
+            the scene around it unless *distance* is given.
+        clearance: Keep the eye at least this far above the top of the
+            scene's bounds (terrain): the view is pulled back, or tilted down,
+            until it is. ``framing.clearance_adjusted`` says which.
 
     rotation, pivot and distance place the viewport's own (non-camera) view,
     after *direction* if both are given, and the reply reads it back as
     ``view``. A viewport looking through a camera is refused: what it shows
     is the camera, so the camera is what to move.
     """
-    direction_map = {
-        "front": hou.geometryViewportType.Front,
-        "back": hou.geometryViewportType.Back,
-        "top": hou.geometryViewportType.Top,
-        "bottom": hou.geometryViewportType.Bottom,
-        "left": hou.geometryViewportType.Left,
-        "right": hou.geometryViewportType.Right,
-        "perspective": hou.geometryViewportType.Perspective,
-    }
-
-    free_view = rotation is not None or pivot is not None or distance is not None
+    framed = (
+        (direction is not None and not isinstance(direction, str))
+        or look_at is not None
+        or clearance is not None
+    )
+    free_view = framed or rotation is not None or pivot is not None or distance is not None
     if direction is None and not free_view:
         raise ValueError("Pass direction, or rotation / pivot / distance for the free view.")
     view_type = None
-    if direction is not None:
-        view_type = direction_map.get(str(direction).lower())
-        if view_type is None:
-            raise ValueError(
-                f"Unknown direction '{direction}'. Supported: {list(direction_map.keys())}"
-            )
+    frame_angles = None
+    if isinstance(direction, str):
+        canonical = _direction_name(direction)
+        if canonical is None:
+            raise _unknown_direction(direction)
+        view_type = getattr(hou.geometryViewportType, _DIRECTION_TYPES[canonical])
+    elif direction is not None:
+        frame_angles = _angles(direction, "direction")
+        if rotation is not None:
+            raise ValueError("Pass direction=[rx, ry] or rotation, not both.")
     # Checked before the viewer is touched, so a bad value never half-applies.
     angles = _vector3(rotation, "rotation") if rotation is not None else None
     centre = _vector3(pivot, "pivot") if pivot is not None else None
-    if distance is not None:
-        try:
-            far = float(distance)
-        except (TypeError, ValueError):
-            far = 0.0
-        if isinstance(distance, bool) or not far > 0:
-            raise ValueError(f"distance must be a positive number, got {distance!r}")
+    target = _vector3(look_at, "look_at") if look_at is not None else None
+    if framed and pivot is not None:
+        raise ValueError(
+            "pivot places the free view as it is; with look_at/direction=[rx, ry] "
+            "the pivot is what the view frames. Pass look_at instead."
+        )
+    far = _positive(distance, "distance") if distance is not None else None
+    lift = _number(clearance, "clearance") if clearance is not None else None
 
     scene_viewer = _find_scene_viewer(pane_name)
     viewport = scene_viewer.curViewport()
@@ -663,38 +763,268 @@ def set_viewport_direction(
     if not free_view:
         return result
 
-    # The view's translation is a world position that the rotation turns about
-    # the pivot: the eye is pivot + R * (translation - pivot). Measured on
-    # 22.0.429: moving only the pivot left the eye where it was, looking past
-    # the new pivot. So the eye's offset from the pivot (pan in x/y, distance
-    # in z) is what is kept, and the translation follows the pivot.
+    if framed:
+        box = _scene_bounds(scene_viewer)
+        if box is None and target is None:
+            raise ValueError("Nothing to frame: no displayed geometry. Pass look_at and distance.")
+        turn = frame_angles or angles or _current_angles(viewport)
+        result["framing"] = _apply_perspective(
+            viewport, box, turn, look_at=target, clearance=lift, distance=far
+        )
+    else:
+        _place_free_view(viewport, angles, centre, far)
+    result["view"] = _read_view(viewport)
+    return result
+
+
+def _place_free_view(viewport, angles, centre, far) -> None:
+    """Turn, re-pivot and dolly the viewport's own view; what is None is kept.
+
+    The view's translation is a world position that the rotation turns about
+    the pivot: the eye is pivot + R * (translation - pivot). Measured on
+    22.0.429: moving only the pivot left the eye where it was, looking past
+    the new pivot. So the eye's offset from the pivot (pan in x/y, distance
+    in z) is what is kept, and the translation follows the pivot.
+    """
     view = viewport.defaultCamera().stash()
     old_pivot = list(view.pivot())
     offset = [t - p for t, p in zip(view.translation(), old_pivot, strict=True)]
     if angles is not None:
-        # setRotation() takes the transpose of what buildRotate() gives: as is,
-        # the view looked along the inverse turn, (0.5, 0.3, -0.8) where a cam
-        # object with the same r looks along (-0.47, -0.34, -0.81) (22.0.429).
-        rotate = hou.hmath.buildRotate(hou.Vector3(*angles))
-        view.setRotation(rotate.extractRotationMatrix3().transposed())
-    if centre is not None or distance is not None:
+        view.setRotation(_view_rotation(angles))
+    if centre is not None or far is not None:
         new_pivot = list(centre) if centre is not None else old_pivot
-        if distance is not None:
+        if far is not None:
             offset[2] = far
         view.setPivot(hou.Vector3(*new_pivot))
         view.setTranslation(hou.Vector3(*(p + o for p, o in zip(new_pivot, offset, strict=True))))
     viewport.setDefaultCamera(view)
 
+
+def _view_rotation(angles):
+    """The matrix setRotation() wants for [rx, ry, rz] degrees.
+
+    setRotation() takes the transpose of what buildRotate() gives: as is, the
+    view looked along the inverse turn, (0.5, 0.3, -0.8) where a cam object
+    with the same r looks along (-0.47, -0.34, -0.81) (22.0.429).
+    """
+    rotate = hou.hmath.buildRotate(hou.Vector3(*angles))
+    return rotate.extractRotationMatrix3().transposed()
+
+
+def _read_view(viewport) -> dict:
+    """The free view as it is now: rotation, pivot, distance (read back, not echoed)."""
     now = viewport.defaultCamera()
     now_pivot = list(now.pivot())
-    result["view"] = {
+    return {
         "rotation": [
             round(v, 4) for v in hou.Matrix4(now.rotation().transposed()).extractRotates()
         ],
         "pivot": [round(v, 4) for v in now_pivot],
         "distance": round(now.translation()[2] - now_pivot[2], 4),
     }
-    return result
+
+
+def _current_angles(viewport) -> tuple:
+    """The free view's [rx, ry, rz], or the default perspective angle when unreadable."""
+    with contextlib.suppress(Exception):
+        angles = tuple(
+            float(v)
+            for v in hou.Matrix4(viewport.defaultCamera().rotation().transposed()).extractRotates()
+        )
+        if len(angles) == 3:
+            return angles
+    return (*_DIRECTION_ANGLES["perspective"], 0.0)
+
+
+###### Perspective framing
+
+
+# A frame leaves this much room around the bounding sphere.
+_FRAME_MARGIN = 1.05
+# The Houdini free view's default lens (50 mm on a 41.4214 aperture): 45 degrees.
+_DEFAULT_HALF_FOV = math.radians(22.5)
+# Looking down at least this steeply, clearance is met by backing off.
+_MIN_DROP_DEGREES = 10.0
+# Never tilt steeper than this to meet clearance; back off as well instead.
+_MAX_TILT_DEGREES = 60.0
+
+
+def _half_fov(aperture, focal, aspect) -> float:
+    """Half of the narrower field of view, in radians, of a lens on a *aspect* frame.
+
+    The aperture is horizontal; a frame wider than tall (aspect > 1) has the
+    narrower angle vertically. Falls back to 22.5 degrees when unreadable.
+    """
+    try:
+        half_h = math.atan(float(aperture) / (2.0 * float(focal)))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return _DEFAULT_HALF_FOV
+    if not 0 < half_h < math.pi / 2:
+        return _DEFAULT_HALF_FOV
+    try:
+        ratio = float(aspect)
+    except (TypeError, ValueError):
+        ratio = 1.0
+    if ratio > 1.0:
+        return math.atan(math.tan(half_h) / ratio)
+    return half_h
+
+
+def _eye_offset(rx: float, ry: float, distance: float) -> tuple:
+    """Where the eye sits relative to the pivot for a view turned [rx, ry] degrees.
+
+    A cam object's convention: r = 0 looks down -Z, so the eye is at +Z;
+    rx < 0 looks down (the eye rises), ry turns about Y (90: from +X).
+    """
+    pitch, yaw = math.radians(rx), math.radians(ry)
+    return (
+        distance * math.cos(pitch) * math.sin(yaw),
+        -distance * math.sin(pitch),
+        distance * math.cos(pitch) * math.cos(yaw),
+    )
+
+
+def _box_corners(box) -> list:
+    return [(x, y, z) for x in (box[0], box[3]) for y in (box[1], box[4]) for z in (box[2], box[5])]
+
+
+def _perspective_plan(
+    box,
+    angles,
+    half_fov: float,
+    *,
+    look_at=None,
+    clearance=None,
+    distance=None,
+    margin: float = _FRAME_MARGIN,
+) -> dict:
+    """Pivot, rotation and distance for a perspective view of *box* from *angles*.
+
+    The distance fits the box's bounding sphere (about *look_at* when given)
+    inside the narrower half field of view, so the eye is always outside the
+    box: a camera can no longer land inside a hill (4g #3). With *clearance*,
+    the eye is also kept that far above the box top: a view looking down at
+    least 10 degrees backs off; a flatter one is tilted down (to 60 degrees at
+    most, backing off beyond that).
+    """
+    rx, ry, rz = (list(angles) + [0.0, 0.0, 0.0])[:3]
+    if look_at is not None:
+        centre = [float(v) for v in look_at]
+    elif box is not None:
+        centre = [(box[i] + box[i + 3]) / 2.0 for i in range(3)]
+    else:
+        raise ValueError("Nothing to frame: pass look_at or bounds.")
+    radius = 0.0
+    if box is not None:
+        radius = max(math.dist(centre, corner) for corner in _box_corners(box))
+    radius = max(radius, 0.5)
+    far = float(distance) if distance is not None else radius / math.sin(half_fov) * margin
+    adjusted = None
+    if clearance is not None and box is not None:
+        need = box[4] + float(clearance) - centre[1]
+        drop = -math.sin(math.radians(rx))
+        if far * drop < need:
+            if drop >= math.sin(math.radians(_MIN_DROP_DEGREES)):
+                far = need / drop
+                adjusted = "distance"
+            elif need / far <= math.sin(math.radians(_MAX_TILT_DEGREES)):
+                rx = -math.degrees(math.asin(need / far))
+                adjusted = "elevation"
+            else:
+                rx = -_MAX_TILT_DEGREES
+                far = need / math.sin(math.radians(_MAX_TILT_DEGREES))
+                adjusted = "elevation_and_distance"
+    offset = _eye_offset(rx, ry, far)
+    plan = {
+        "rotation": [round(rx, 4), round(ry, 4), round(rz, 4)],
+        "pivot": [round(v, 4) for v in centre],
+        "distance": round(far, 4),
+        "eye": [round(c + o, 4) for c, o in zip(centre, offset, strict=True)],
+    }
+    if box is not None:
+        plan["framed_bounds"] = [round(v, 4) for v in box]
+    if adjusted:
+        plan["clearance_adjusted"] = adjusted
+    return plan
+
+
+def _viewport_pixels(viewport) -> tuple | None:
+    """(width, height) of *viewport* in pixels, or None."""
+    with contextlib.suppress(Exception):
+        size = tuple(viewport.resolutionInPixels())
+        if len(size) == 2 and all(isinstance(v, int) and v > 0 for v in size):
+            return size
+    return None
+
+
+def _change_type(viewport, view_type, state: dict | None = None) -> None:
+    """changeType(), recording the new type's own view first so a restore can put it back."""
+    current = None
+    with contextlib.suppress(Exception):
+        current = viewport.type()
+    if current is not None and current == view_type:
+        return
+    viewport.changeType(view_type)
+    if state is not None:
+        with contextlib.suppress(Exception):
+            state["views"].append((view_type, viewport.defaultCamera().stash()))
+
+
+def _apply_perspective(
+    viewport, box, angles, *, look_at=None, clearance=None, distance=None, state=None
+) -> dict:
+    """Put the viewport's own view in perspective, framing *box* from *angles*."""
+    _change_type(viewport, hou.geometryViewportType.Perspective, state)
+    camera = viewport.defaultCamera()
+    aperture = focal = None
+    with contextlib.suppress(Exception):
+        aperture, focal = camera.aperture(), camera.focalLength()
+    pixels = _viewport_pixels(viewport)
+    aspect = pixels[0] / pixels[1] if pixels else 1.0
+    plan = _perspective_plan(
+        box,
+        angles,
+        _half_fov(aperture, focal, aspect),
+        look_at=look_at,
+        clearance=clearance,
+        distance=distance,
+    )
+    view = camera.stash()
+    view.setRotation(_view_rotation(plan["rotation"]))
+    pivot = plan["pivot"]
+    view.setPivot(hou.Vector3(*pivot))
+    view.setTranslation(hou.Vector3(pivot[0], pivot[1], pivot[2] + plan["distance"]))
+    viewport.setDefaultCamera(view)
+    return plan
+
+
+def _scene_bounds(scene_viewer) -> list | None:
+    """World bounds of what the viewer shows: the object it is in, else every displayed object."""
+    network = None
+    with contextlib.suppress(Exception):
+        network = scene_viewer.pwd()
+    owner = network
+    with contextlib.suppress(Exception):
+        while owner is not None and not isinstance(owner, hou.ObjNode):
+            owner = owner.parent()
+    if owner is not None:
+        with contextlib.suppress(Exception):
+            found = _world_bounds(owner)
+            if found is not None:
+                return found
+    box = None
+    with contextlib.suppress(Exception):
+        for child in hou.node("/obj").children()[:500]:
+            if not isinstance(child, hou.ObjNode) or not child.isObjectDisplayed():
+                continue
+            found = _world_bounds(child)
+            if found is not None:
+                box = found if box is None else _union(box, found)
+    return box
+
+
+def _union(a: list, b: list) -> list:
+    return [min(a[i], b[i]) for i in range(3)] + [max(a[i], b[i]) for i in range(3, 6)]
 
 
 ###### viewport.set_viewport_renderer
@@ -873,13 +1203,25 @@ def _world_bounds(node: hou.Node) -> list | None:
     ]
 
 
-def frame_all(pane_name: str = None, node_paths: list = None, bounds: list = None) -> dict:
+def frame_all(
+    pane_name: str = None,
+    node_paths: list = None,
+    bounds: list = None,
+    direction=None,
+    clearance: float = None,
+) -> dict:
     """Frame all geometry in the viewport (home all), or only some of it.
 
     Args:
         pane_name: Optional pane tab name.
         node_paths: Frame the world bounds of these objects or SOPs only.
         bounds: Frame [xmin, ymin, zmin, xmax, ymax, zmax], in world space.
+        direction: [rx, ry] degrees (or a direction name: 'top', 'persp'...):
+            frame in perspective from that angle, the distance worked out
+            from the bounds and the field of view, so the eye is always
+            outside them. Without it the view keeps its angle.
+        clearance: With *direction*: keep the eye this far above the top of
+            the bounds (terrain); ``framing.clearance_adjusted`` says how.
 
     With *node_paths* or *bounds* (both: the box around all of them), the
     reply carries ``framed_bounds``, and ``no_geometry`` names any node that
@@ -887,6 +1229,10 @@ def frame_all(pane_name: str = None, node_paths: list = None, bounds: list = Non
     a camera or a light its icon. A box with no size (a point) is framed as a
     1-unit cube around it, and ``padded`` says so.
     """
+    turn = _angles(direction, "direction") if direction is not None else None
+    lift = _number(clearance, "clearance") if clearance is not None else None
+    if lift is not None and turn is None:
+        raise ValueError("clearance applies to a perspective framing: pass direction=[rx, ry] too.")
     box = None
     empty: list = []
     if bounds is not None:
@@ -934,6 +1280,18 @@ def frame_all(pane_name: str = None, node_paths: list = None, bounds: list = Non
             f"The viewport stopped looking through {looks_through} to frame; the camera "
             f"did not move. set_viewport_camera looks through it again."
         )
+    if turn is not None:
+        if box is None:
+            box = _scene_bounds(scene_viewer)
+        if box is None:
+            raise ValueError("Nothing to frame: no displayed geometry. Pass node_paths or bounds.")
+        framing = _apply_perspective(viewport, box, turn, clearance=lift)
+        result["framed_bounds"] = framing.pop("framed_bounds")
+        result["framing"] = framing
+        result["view"] = _read_view(viewport)
+        if empty:
+            result["no_geometry"] = empty
+        return result
     if box is None:
         viewport.homeAll()
         return result
@@ -949,12 +1307,525 @@ def frame_all(pane_name: str = None, node_paths: list = None, bounds: list = Non
     return result
 
 
+###### Capture helpers
+
+
+def _fit_size(width: int, height: int, max_size: int | None) -> tuple:
+    """(width, height) scaled down to fit *max_size* on its longer side; as is when it fits."""
+    width, height = int(width), int(height)
+    if not max_size or max(width, height) <= max_size:
+        return (width, height)
+    scale = max_size / float(max(width, height))
+    return (max(1, round(width * scale)), max(1, round(height * scale)))
+
+
+def _resolution_arg(resolution) -> list | None:
+    """[width, height] of positive ints, or a ValueError."""
+    if resolution is None:
+        return None
+    try:
+        size = [int(v) for v in resolution]
+    except (TypeError, ValueError):
+        size = []
+    if len(size) != 2 or min(size) < 1 or any(isinstance(v, bool) for v in resolution):
+        raise ValueError(f"resolution must be [width, height] in pixels, got {resolution!r}")
+    return size
+
+
+def _max_size_arg(max_size) -> int | None:
+    if max_size is None:
+        return None
+    if isinstance(max_size, bool) or not isinstance(max_size, (int, float)) or max_size < 16:
+        raise ValueError(f"max_size must be a number of pixels >= 16, got {max_size!r}")
+    return int(max_size)
+
+
+def _max_size_kw(max_size) -> dict:
+    """Keyword for _capture_pane_tab_qt, only when a cap was asked for."""
+    return {"max_size": max_size} if max_size else {}
+
+
+def _flipbook_resolution(viewport, resolution, max_size) -> list | None:
+    """The flipbook's [width, height]: *resolution*, capped by *max_size*; None = the viewport's own.
+
+    max_size alone scales the viewport's own size down, keeping its shape.
+    """
+    if resolution is not None:
+        return list(_fit_size(resolution[0], resolution[1], max_size))
+    if max_size:
+        pixels = _viewport_pixels(viewport)
+        if pixels is not None:
+            fitted = _fit_size(pixels[0], pixels[1], max_size)
+            if fitted != tuple(pixels):
+                return list(fitted)
+    return None
+
+
+def _flipbook_still(scene_viewer, viewport, output_path: str, frame: float, resolution) -> str:
+    """One flipbook frame of *viewport* to *output_path*; the path actually written."""
+    from fxhoudinimcp_server.handlers.rendering_handlers import (
+        _find_flipbook_output,
+        _size_flipbook,
+    )
+
+    settings = scene_viewer.flipbookSettings().stash()
+    settings.frameRange((frame, frame))
+    settings.output(output_path)
+    _no_mplay(settings)
+    # The viewport as it is, not the stash's 1280x720, unless a size is asked.
+    _size_flipbook(settings, resolution)
+    # A selected object would be drawn with its selection outline.
+    with selection_hidden():
+        scene_viewer.flipbook(viewport, settings)
+    # Handle frame number that flipbook may insert
+    return _find_flipbook_output(output_path, frame)
+
+
+_CAMERA_KEYS = ("direction", "rotation", "pivot", "distance", "look_at", "clearance")
+
+
+def _camera_spec(camera):
+    """A capture's *camera*, checked: a camera path (str), a view dict, or None."""
+    if camera is None or isinstance(camera, str):
+        if isinstance(camera, str) and not camera.strip():
+            raise ValueError("camera must be a camera path or a view dict, got ''")
+        return camera
+    if not isinstance(camera, dict):
+        raise ValueError(
+            f"camera must be a camera path or a dict of {list(_CAMERA_KEYS)}, got {camera!r}"
+        )
+    unknown = sorted(set(camera) - set(_CAMERA_KEYS))
+    if unknown:
+        raise ValueError(f"Unknown camera key(s) {unknown}. Known: {list(_CAMERA_KEYS)}")
+    spec: dict = {}
+    direction = camera.get("direction")
+    if isinstance(direction, str):
+        canonical = _direction_name(direction)
+        if canonical is None:
+            raise _unknown_direction(direction)
+        spec["direction"] = canonical
+    elif direction is not None:
+        spec["direction"] = _angles(direction, "camera.direction")
+    if camera.get("rotation") is not None:
+        spec["rotation"] = _vector3(camera["rotation"], "camera.rotation")
+    if camera.get("pivot") is not None:
+        spec["pivot"] = _vector3(camera["pivot"], "camera.pivot")
+    if camera.get("look_at") is not None:
+        spec["look_at"] = _vector3(camera["look_at"], "camera.look_at")
+    if camera.get("distance") is not None:
+        spec["distance"] = _positive(camera["distance"], "camera.distance")
+    if camera.get("clearance") is not None:
+        spec["clearance"] = _number(camera["clearance"], "camera.clearance")
+    if not spec:
+        raise ValueError(f"camera names nothing to set; pass any of {list(_CAMERA_KEYS)}")
+    if isinstance(spec.get("direction"), tuple) and "rotation" in spec:
+        raise ValueError("camera: pass direction=[rx, ry] or rotation, not both.")
+    if "pivot" in spec and ("look_at" in spec or isinstance(spec.get("direction"), tuple)):
+        raise ValueError(
+            "camera: pivot places the free view as it is; with look_at or "
+            "direction=[rx, ry] pass look_at instead."
+        )
+    return spec
+
+
+def _apply_camera(scene_viewer, viewport, spec, box, state: dict) -> dict:
+    """Put the view where *spec* says, for one capture; *state* restores it afterwards."""
+    state["view_changed"] = True
+    if isinstance(spec, str):
+        node = hou.node(spec)
+        viewport.setCamera(node if node is not None else spec)
+        return {"camera": spec}
+    applied: dict = {}
+    direction = spec.get("direction")
+    if isinstance(direction, str):
+        _change_type(
+            viewport, getattr(hou.geometryViewportType, _DIRECTION_TYPES[direction]), state
+        )
+        if box is not None:
+            viewport.frameBoundingBox(hou.BoundingBox(*box))
+        else:
+            viewport.frameAll()
+        applied["direction"] = direction
+    # A rotation alone kept the old pivot and distance, so a node= capture
+    # looked at wherever the view happened to be (live check): with neither
+    # pivot nor distance, the rotation is the angle to frame the target from.
+    rotation_only = "rotation" in spec and "pivot" not in spec and "distance" not in spec
+    framed = (
+        isinstance(direction, tuple) or "look_at" in spec or "clearance" in spec or rotation_only
+    )
+    if framed:
+        turn = direction if isinstance(direction, tuple) else spec.get("rotation")
+        target = box if box is not None else _scene_bounds(scene_viewer)
+        applied["framing"] = _apply_perspective(
+            viewport,
+            target,
+            turn or _current_angles(viewport),
+            look_at=spec.get("look_at"),
+            clearance=spec.get("clearance"),
+            distance=spec.get("distance"),
+            state=state,
+        )
+    elif any(key in spec for key in ("rotation", "pivot", "distance")):
+        _place_free_view(viewport, spec.get("rotation"), spec.get("pivot"), spec.get("distance"))
+    with contextlib.suppress(Exception):
+        applied["view"] = _read_view(viewport)
+    return applied
+
+
+_MISSING = object()
+
+
+def _save_view(scene_viewer) -> dict:
+    """What a capture may change on *scene_viewer*, for _restore_view."""
+    viewport = scene_viewer.curViewport()
+    state: dict = {"viewport": viewport, "views": [], "view_changed": False}
+    readers = (
+        ("pwd", lambda: scene_viewer.pwd().path()),
+        ("type", viewport.type),
+        ("view", lambda: viewport.defaultCamera().stash()),
+        ("camera", lambda: _looked_through(viewport)[0]),
+        ("visible_objects", lambda: viewport.settings().visibleObjects()),
+        (
+            "editors",
+            lambda: [
+                (tab, tab.pwd().path())
+                for tab in hou.ui.paneTabs()
+                if tab.type() == hou.paneTabType.NetworkEditor
+            ],
+        ),
+    )
+    for key, read in readers:
+        try:
+            state[key] = read()
+        except Exception:
+            state[key] = _MISSING
+    return state
+
+
+def _restore_view(scene_viewer, state: dict) -> list:
+    """Put back what _save_view recorded; the names of what could not be put back."""
+    failed: list = []
+    viewport = state["viewport"]
+
+    def attempt(name, action):
+        try:
+            action()
+        except Exception:
+            failed.append(name)
+
+    pwd = state.get("pwd", _MISSING)
+    if pwd is not _MISSING:
+
+        def _pwd():
+            if scene_viewer.pwd().path() != pwd:
+                scene_viewer.setPwd(hou.node(pwd))
+
+        attempt("network", _pwd)
+    editors = state.get("editors", _MISSING)
+    if editors is not _MISSING:
+        # The Network Editor follows the viewer's network when the panes are linked.
+        with keep_viewer_state():
+            for tab, path in editors:
+                try:
+                    if tab.pwd().path() != path:
+                        tab.cd(path)
+                except Exception:
+                    failed.append(f"network_editor:{path}")
+    if state.get("view_changed"):
+        for view_type, view in reversed(state["views"]):
+            attempt("view", lambda t=view_type, v=view: _put_view(viewport, t, v))
+        if state.get("type", _MISSING) is not _MISSING:
+            attempt("view_type", lambda: _change_type(viewport, state["type"]))
+        if state.get("view", _MISSING) is not _MISSING:
+            attempt("view", lambda: viewport.setDefaultCamera(state["view"]))
+    camera = state.get("camera", _MISSING)
+    if camera is not _MISSING:
+
+        def _camera():
+            now = _looked_through(viewport)[0]
+            if camera and now != camera:
+                viewport.setCamera(hou.node(camera) or camera)
+            elif not camera and now:
+                viewport.useDefaultCamera()
+
+        attempt("camera", _camera)
+    pattern = state.get("visible_objects", _MISSING)
+    if pattern is not _MISSING:
+
+        def _pattern():
+            settings = viewport.settings()
+            if settings.visibleObjects() != pattern:
+                settings.setVisibleObjects(pattern)
+
+        attempt("visible_objects", _pattern)
+    return sorted(set(failed))
+
+
+def _put_view(viewport, view_type, view) -> None:
+    _change_type(viewport, view_type)
+    viewport.setDefaultCamera(view)
+
+
+@contextlib.contextmanager
+def preserved_view(scene_viewer):
+    """The viewer's network, view, camera and Visible Objects, put back after the block.
+
+    Yields the saved state; after the block its ``not_restored`` lists what
+    could not be put back (empty when everything was).
+    """
+    state = _save_view(scene_viewer)
+    try:
+        yield state
+    finally:
+        state["not_restored"] = _restore_view(scene_viewer, state)
+
+
+@contextlib.contextmanager
+def _undo_off():
+    """No undo entries for the scratch nodes a capture makes and removes."""
+    disabler = None
+    with contextlib.suppress(Exception):
+        disabler = hou.undos.disabler()
+    if disabler is None:
+        yield
+        return
+    with disabler:
+        yield
+
+
+def scratch_child(parent, type_name: str, name: str | None = None):
+    """A node a capture makes and destroys in the same call, so it is never placed."""
+    with _undo_off():
+        return parent.createNode(type_name, name)
+
+
+#: Name of the temporary object a capture draws one node through.
+SCRATCH_NAME = "mcp_capture_tmp"
+
+
+@contextlib.contextmanager
+def scratch_object(sources: list, name: str = SCRATCH_NAME):
+    """A temporary /obj geo that object-merges *sources* in world space; destroyed after.
+
+    Yields (object, object_merge SOP). Nothing else in the scene changes: no
+    display flag moves and the source nodes are only read.
+    """
+    obj_net = hou.node("/obj")
+    if obj_net is None:
+        raise RuntimeError("/obj not found: cannot make the temporary capture object.")
+    obj = scratch_child(obj_net, "geo", name)
+    try:
+        with _undo_off():
+            for child in list(obj.children()):
+                child.destroy()
+            merge = scratch_child(obj, "object_merge", "sources")
+            merge.parm("numobj").set(len(sources))
+            for index, path in enumerate(sources, 1):
+                merge.parm(f"objpath{index}").set(path)
+            # "Into This Object": the object is at the origin, so this is world space.
+            merge.parm("xformtype").set(1)
+            merge.setDisplayFlag(True)
+            merge.setRenderFlag(True)
+        yield obj, merge
+    finally:
+        with _undo_off(), contextlib.suppress(Exception):
+            obj.destroy()
+
+
+def isolate(scene_viewer, viewport, obj) -> None:
+    """Draw only *obj*: the viewer at its network, Visible Objects set to it."""
+    scene_viewer.setPwd(obj.parent())
+    viewport.settings().setVisibleObjects(obj.name())
+
+
+def _capturable_node(path: str):
+    """The SOP or object *path* names, or a ValueError saying what node= takes."""
+    node = hou.node(path)
+    if node is None:
+        raise ValueError(f"Node not found: {path}")
+    is_obj = isinstance(node, hou.ObjNode)
+    is_sop = False
+    with contextlib.suppress(Exception):
+        is_sop = node.type().category() == hou.sopNodeTypeCategory()
+    if not (is_obj or is_sop):
+        kind = "unknown"
+        with contextlib.suppress(Exception):
+            kind = node.type().category().name()
+        raise ValueError(
+            f"node= draws SOP or object geometry; {path} is a {kind} node. For a LOP "
+            "stage use set_viewer_context, for a DOP network network=."
+        )
+    return node
+
+
+def _network_arg(path: str):
+    """The network *path* names; a node that is not one stands for its parent."""
+    node = hou.node(path)
+    if node is None:
+        raise ValueError(f"Network not found: {path}")
+    with contextlib.suppress(Exception):
+        if not node.isNetwork() and node.parent() is not None:
+            return node.parent()
+    return node
+
+
+def _plain(value):
+    """*value* if it is a JSON-plain str/int/float/bool, else None."""
+    return value if isinstance(value, (str, int, float, bool)) else None
+
+
+def _count(geo, intrinsic: str, method: str) -> int | None:
+    for read in (lambda: geo.intrinsicValue(intrinsic), lambda: getattr(geo, method)()):
+        try:
+            value = read()
+        except Exception:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+
+#: Primitive kinds worth naming in a capture reply, by hou.primType attribute.
+_NOTED_PRIM_TYPES = (
+    ("volumes", "Volume"),
+    ("vdbs", "VDB"),
+    ("packed", "PackedPrim"),
+    ("agents", "Agent"),
+)
+
+
+def _geometry_summary(sop) -> dict | None:
+    """{prims, points, prim_types} of what *sop* cooks to, or None."""
+    try:
+        geo = sop.geometry()
+    except Exception:
+        return None
+    if geo is None:
+        return None
+    summary = {
+        "prims": _count(geo, "primitivecount", "primCount"),
+        "points": _count(geo, "pointcount", "pointCount"),
+    }
+    types: dict = {}
+    for label, attr in _NOTED_PRIM_TYPES:
+        with contextlib.suppress(Exception):
+            number = geo.countPrimType(getattr(hou.primType, attr))
+            if isinstance(number, int) and not isinstance(number, bool) and number:
+                types[label] = number
+    if types:
+        summary["prim_types"] = types
+    return summary
+
+
+#: Guides whose being off hides geometry from a capture, by hou.viewportGuide name.
+_HIDING_GUIDES = (
+    ("DisplayNodes", "display_nodes"),
+    ("TemplateGeometry", "template_geometry"),
+    ("CurrentGeometry", "current_geometry"),
+    ("NodeGuides", "node_guides"),
+)
+_MAX_DRAWN_OBJECTS = 50
+
+
+def _drawn_report(scene_viewer, viewport, source: str | None = None, sop=None) -> dict:
+    """What a capture draws: which node(s), how many prims/points, what is switched off.
+
+    Best effort: a value the viewer cannot give is left out. *sop* is the
+    node actually drawn when a capture isolated one (*source* is what it shows).
+    """
+    drawn: dict = {}
+    sources: list = []
+    if sop is not None:
+        drawn["node"] = source
+        drawn["via"] = "a temporary object merge; no display flag was moved"
+        sources = [sop]
+    else:
+        with contextlib.suppress(Exception):
+            network = scene_viewer.pwd()
+            category = network.childTypeCategory()
+            if category == hou.sopNodeTypeCategory():
+                display = network.displayNode()
+                drawn["display_node"] = _plain(display.path()) if display is not None else None
+                sources = [display] if display is not None else []
+            elif category == hou.objNodeTypeCategory():
+                from fxhoudinimcp_server.ui import pattern_hides
+
+                pattern = ""
+                with contextlib.suppress(Exception):
+                    pattern = viewport.settings().visibleObjects()
+                shown = [
+                    child
+                    for child in network.children()
+                    if isinstance(child, hou.ObjNode)
+                    and child.isObjectDisplayed()
+                    and not (isinstance(pattern, str) and pattern_hides(pattern, child.path()))
+                ]
+                drawn["objects"] = [_plain(child.path()) for child in shown[:12]]
+                drawn["object_count"] = len(shown)
+                for child in shown[:_MAX_DRAWN_OBJECTS]:
+                    with contextlib.suppress(Exception):
+                        display = child.displayNode()
+                        if display is not None:
+                            sources.append(display)
+    prims = points = 0
+    counted = False
+    kinds: dict = {}
+    for node in sources:
+        summary = _geometry_summary(node)
+        if summary is None:
+            continue
+        if summary["prims"] is not None:
+            prims += summary["prims"]
+            counted = True
+        if summary["points"] is not None:
+            points += summary["points"]
+            counted = True
+        for label, number in summary.get("prim_types", {}).items():
+            kinds[label] = kinds.get(label, 0) + number
+    if counted:
+        drawn["prims"], drawn["points"] = prims, points
+    if kinds:
+        drawn["prim_types"] = kinds
+    settings = None
+    with contextlib.suppress(Exception):
+        settings = viewport.settings()
+    off = []
+    for attr, label in _HIDING_GUIDES:
+        with contextlib.suppress(Exception):
+            if settings.guideEnabled(getattr(hou.viewportGuide, attr)) is False:
+                off.append(label)
+    if off:
+        drawn["guides_off"] = off
+    with contextlib.suppress(Exception):
+        pattern = settings.visibleObjects()
+        if isinstance(pattern, str) and pattern.strip() not in ("", "*"):
+            drawn["visible_objects"] = pattern
+    with contextlib.suppress(Exception):
+        looked, _ = _looked_through(viewport)
+        if isinstance(looked, str) and looked:
+            drawn["camera"] = looked
+    notes = []
+    if counted and prims == 0 and points == 0:
+        notes.append("The viewer draws no geometry here: the frame shows only the grid.")
+    if "display_nodes" in off:
+        notes.append("The Display Nodes guide is off, so no SOP display geometry is drawn.")
+    if notes:
+        drawn["note"] = " ".join(notes)
+    return drawn
+
+
 ###### viewport.capture_screenshot
 
 
 def capture_screenshot(
     output_path: str,
     pane_name: str = None,
+    node: str = None,
+    network: str = None,
+    camera=None,
+    resolution: list = None,
+    max_size: int = None,
+    frame: bool = None,
 ) -> dict:
     """Capture a screenshot of a specific pane tab, or the active viewport.
 
@@ -962,6 +1833,22 @@ def capture_screenshot(
         output_path: Destination image path.
         pane_name: Name of the pane tab to capture. If not provided,
             captures the first Scene Viewer found.
+        node: Draw only this SOP's (or object's) geometry, through a
+            temporary object merge: no display flag moves. Framed on it
+            unless *camera* places the view or *frame* is False.
+        network: Show the viewer at this network for the capture only.
+        camera: A camera path to look through, or a view dict with any of
+            direction (a name or [rx, ry]), rotation, pivot, distance,
+            look_at, clearance: set and captured in one call.
+        resolution: [width, height] of the image.
+        max_size: Cap on the longer side, in pixels (scales down only).
+        frame: Frame *node* (default True when *node* is given).
+
+    Everything moved for the capture (network, view, camera, Visible
+    Objects) is put back afterwards; ``restored`` says so, ``not_restored``
+    names anything that could not be. ``drawn`` reports what the image
+    holds: display node or objects, prim and point counts, guides switched
+    off, the Visible Objects pattern, the camera looked through.
     """
     # Houdini variables ($JOB, $HIP) are expanded, as load_scene does: a
     # "$JOB/..." path reached os.makedirs or os.path as written and failed.
@@ -970,38 +1857,75 @@ def capture_screenshot(
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
+    # Checked before anything moves, so a bad value never half-applies.
+    spec = _camera_spec(camera)
+    size = _resolution_arg(resolution)
+    cap = _max_size_arg(max_size)
+    if node is not None and network is not None:
+        raise ValueError("Pass node or network, not both: node= draws one node on its own.")
+    source = _capturable_node(node) if node is not None else None
+    pinned = _network_arg(network) if network is not None else None
+
     # Named pane if asked for, otherwise the first Scene Viewer.
     pane_tab = _find_pane_by_name(pane_name) if pane_name is not None else _find_scene_viewer()
 
     cur_frame = hou.frame()
 
-    # For scene viewers, use flipbook for capture
-    viewer: dict = {}
-    if pane_tab.type() == hou.paneTabType.SceneViewer:
+    if pane_tab.type() != hou.paneTabType.SceneViewer:
+        if source is not None or pinned is not None or spec is not None or size is not None:
+            raise ValueError(
+                f"node, network, camera and resolution need a Scene Viewer; pane "
+                f"'{pane_tab.name()}' is not one. max_size works on any pane."
+            )
+        # For other pane types, use Qt widget grab
+        _capture_pane_tab_qt(pane_tab, output_path, **_max_size_kw(cap))
+        return {
+            "success": True,
+            "pane_name": pane_tab.name(),
+            "output_path": output_path,
+            "file_exists": os.path.isfile(output_path),
+        }
+
+    moves = source is not None or pinned is not None or spec is not None
+    reply: dict = {}
+    with contextlib.ExitStack() as stack:
+        scratch = None
+        state = None
+        if source is not None:
+            scratch = stack.enter_context(scratch_object([source.path()]))
+        if moves:
+            stack.enter_context(keep_viewer_state())
+            state = stack.enter_context(preserved_view(pane_tab))
+            viewport = pane_tab.curViewport()
+            box = None
+            if scratch is not None:
+                isolate(pane_tab, viewport, scratch[0])
+                box = _world_bounds(source)
+            elif pinned is not None:
+                pane_tab.setPwd(pinned)
+            if spec is not None:
+                reply["view_applied"] = _apply_camera(pane_tab, viewport, spec, box, state)
+            elif box is not None and frame is not False:
+                state["view_changed"] = True
+                viewport.frameBoundingBox(hou.BoundingBox(*box))
+                reply["framed_bounds"] = [round(v, 4) for v in box]
+        viewport = pane_tab.curViewport()
         # Which network the image shows, and a note when it is a DOP view.
         viewer = viewer_context(pane_tab)
-        viewport = pane_tab.curViewport()
-        from fxhoudinimcp_server.handlers.rendering_handlers import (
-            _find_flipbook_output,
-            _size_flipbook,
+        reply["drawn"] = _drawn_report(
+            pane_tab,
+            viewport,
+            source=source.path() if source is not None else None,
+            sop=scratch[1] if scratch is not None else None,
         )
-
-        settings = pane_tab.flipbookSettings().stash()
-        settings.frameRange((cur_frame, cur_frame))
-        settings.output(output_path)
-        _no_mplay(settings)
-        # The viewport as it is, not the stash's 1280x720.
-        _size_flipbook(settings, None)
-        # A selected object would be drawn with its selection outline.
-        with selection_hidden():
-            pane_tab.flipbook(viewport, settings)
-
-        # Handle frame number that flipbook may insert
-        actual_path = _find_flipbook_output(output_path, cur_frame)
-    else:
-        actual_path = output_path
-        # For other pane types, use Qt widget grab
-        _capture_pane_tab_qt(pane_tab, output_path)
+        flip_size = _flipbook_resolution(viewport, size, cap)
+        actual_path = _flipbook_still(pane_tab, viewport, output_path, cur_frame, flip_size)
+        if flip_size is not None:
+            reply["resolution"] = flip_size
+    if state is not None:
+        reply["restored"] = not state.get("not_restored")
+        if state.get("not_restored"):
+            reply["not_restored"] = state["not_restored"]
 
     return {
         "success": True,
@@ -1009,6 +1933,7 @@ def capture_screenshot(
         "output_path": actual_path,
         "file_exists": os.path.isfile(actual_path),
         **viewer,
+        **reply,
     }
 
 
@@ -1018,6 +1943,9 @@ def capture_screenshot(
 # immediate neighbours to show, few enough that the node is still readable.
 _FRAME_PAD_X = 5.0
 _FRAME_PAD_Y = 3.0
+# Below this many pixels per network unit (about one node width) node names
+# cannot be read in the image.
+_READABLE_PX_PER_UNIT = 30.0
 
 
 def _bounds_list(bounds) -> list | None:
@@ -1060,19 +1988,126 @@ def _frame_node(network_editor, node) -> list:
     return [round(v, 3) for v in (xmin, ymin, xmax, ymax)]
 
 
+def _item_rects(network) -> list:
+    """[xmin, ymin, xmax, ymax] of every node, network box and sticky note in *network*."""
+    items: list = []
+    for reader in ("children", "networkBoxes", "stickyNotes"):
+        with contextlib.suppress(Exception):
+            items.extend(getattr(network, reader)())
+    rects = []
+    for item in items:
+        with contextlib.suppress(Exception):
+            pos, size = item.position(), item.size()
+            rects.append([pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]])
+    return rects
+
+
+def _items_frame(rects: list, margin: float = 0.05) -> list | None:
+    """The union of *rects* grown by *margin* of its extent (at least one unit) each side."""
+    if not rects:
+        return None
+    box = [
+        min(r[0] for r in rects),
+        min(r[1] for r in rects),
+        max(r[2] for r in rects),
+        max(r[3] for r in rects),
+    ]
+    pad = max(1.0, margin * max(box[2] - box[0], box[3] - box[1]))
+    return [box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad]
+
+
+def _readability(network_editor, visible: list | None) -> dict:
+    """Pixels per network unit in the image, and a note when names will not be readable."""
+    if not visible:
+        return {}
+    width_px = None
+    with contextlib.suppress(Exception):
+        screen = network_editor.screenBounds()
+        width_px = float(screen.max()[0] - screen.min()[0])
+    units = visible[2] - visible[0]
+    if not width_px or units <= 0:
+        return {}
+    density = round(width_px / units, 1)
+    found: dict = {"pixels_per_unit": density}
+    if density < _READABLE_PX_PER_UNIT:
+        found["readability_note"] = (
+            f"{density} pixels per node width: node names will not be readable. Capture part "
+            "of the network with node_path, or widen the Network Editor pane."
+        )
+    return found
+
+
+#: The editor's place before a capture that moved it, put back by the follow-up
+#: after its repaint grab (restoring in the handler would be grabbed instead).
+_EDITOR_RESTORE: dict = {}
+
+
+def _editor_snapshot(network_editor) -> dict:
+    snap: dict = {"editor": network_editor}
+    with contextlib.suppress(Exception):
+        snap["pwd"] = network_editor.pwd().path()
+    with contextlib.suppress(Exception):
+        snap["bounds"] = network_editor.visibleBounds()
+    with contextlib.suppress(Exception):
+        snap["current"] = network_editor.currentNode()
+    return snap
+
+
+def _restore_editor() -> list | None:
+    """Put the editor back where the capture found it; None when nothing was pending.
+
+    Returns what could not be put back (empty when everything was).
+    """
+    snap = _EDITOR_RESTORE.pop("pending", None)
+    if snap is None:
+        return None
+    editor = snap["editor"]
+    failed: list = []
+    if "pwd" in snap:
+        with keep_viewer_state():
+            try:
+                if editor.pwd().path() != snap["pwd"]:
+                    editor.cd(snap["pwd"])
+            except Exception:
+                failed.append("network")
+    current = snap.get("current")
+    if current is not None:
+        with contextlib.suppress(Exception):
+            if current.parent().path() == snap.get("pwd"):
+                editor.setCurrentNode(current, False)
+    if "bounds" in snap:
+        try:
+            editor.setVisibleBounds(
+                snap["bounds"], transition_time=0.0, set_center_when_scale_rejected=True
+            )
+        except Exception:
+            failed.append("view")
+    return failed
+
+
 def capture_network_editor(
     output_path: str,
     node_path: str = None,
+    network_path: str = None,
+    frame: str = None,
+    max_size: int = None,
 ) -> dict:
     """Capture a screenshot of the network editor.
 
     Args:
         output_path: Destination image path.
         node_path: Optional node path to frame before capture.
+        network_path: Show this network for the capture (default: the
+            node's network, else where the editor is).
+        frame: "all" frames every node, network box and sticky note of the
+            network; "node" (the default with *node_path*) frames the node.
+        max_size: Cap on the image's longer side, in pixels (scales down).
 
     The reply carries ``visible_bounds`` (the network space the image shows)
     and, with *node_path*, ``node_bounds`` and ``node_in_view``, so what the
-    image holds can be checked without opening it.
+    image holds can be checked without opening it. A capture that moved the
+    editor puts it back (network, view, current node) once the image is
+    taken.
     """
     # Houdini variables ($JOB, $HIP) are expanded, as load_scene does: a
     # "$JOB/..." path reached os.makedirs or os.path as written and failed.
@@ -1080,6 +2115,10 @@ def capture_network_editor(
     out_dir = os.path.dirname(output_path)
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
+
+    if frame not in (None, "all", "node"):
+        raise ValueError(f"frame must be 'all' or 'node', got {frame!r}")
+    cap = _max_size_arg(max_size)
 
     network_editor = None
     for pane_tab in hou.ui.paneTabs():
@@ -1097,23 +2136,57 @@ def capture_network_editor(
         node = hou.node(node_path)
         if node is None:
             raise ValueError(f"Node not found: {node_path}")
-    # Showing a node in a DOP network takes the Scene Viewer there too; the
-    # editor goes back after the shot.
-    with viewer_stays_out_of_dops():
-        if node is not None:
+    if frame == "node" and node is None:
+        raise ValueError("frame='node' needs node_path.")
+    network = None
+    if network_path is not None:
+        network = hou.node(network_path)
+        if network is None:
+            raise ValueError(f"Network not found: {network_path}")
+        if node is not None and node.parent() is not None and node.parent() != network:
+            raise ValueError(f"{node_path} is not in {network_path}.")
+    elif node is not None:
+        network = node.parent()
+
+    moves = node is not None or network is not None or frame is not None
+    if moves and "pending" not in _EDITOR_RESTORE:
+        _EDITOR_RESTORE["pending"] = _editor_snapshot(network_editor)
+    framed_all = None
+    try:
+        # Showing a node in a DOP network takes the Scene Viewer there too;
+        # the editor goes back after the shot.
+        with viewer_stays_out_of_dops():
             with keep_viewer_state():
-                parent = node.parent()
-                if parent is not None:
-                    network_editor.cd(parent.path())
-                network_editor.setCurrentNode(node)
+                if network is not None:
+                    network_editor.cd(network.path())
+                if node is not None:
+                    network_editor.setCurrentNode(node)
+            if frame == "all":
+                shown = network if network is not None else network_editor.pwd()
+                framed_all = _items_frame(_item_rects(shown))
+                if framed_all is not None:
+                    network_editor.setVisibleBounds(
+                        hou.BoundingRect(*framed_all),
+                        transition_time=0.0,
+                        set_center_when_scale_rejected=True,
+                    )
+                if node is not None:
+                    pos, size = node.position(), node.size()
+                    node_bounds = [
+                        round(v, 3) for v in (pos[0], pos[1], pos[0] + size[0], pos[1] + size[1])
+                    ]
+            elif node is not None:
                 node_bounds = _frame_node(network_editor, node)
 
-        # Capture the network editor via Qt widget grab
-        _capture_pane_tab_qt(network_editor, output_path)
-        # What the image shows, read before the editor can go back.
-        visible_bounds = None
-        with contextlib.suppress(Exception):
-            visible_bounds = _bounds_list(network_editor.visibleBounds())
+            # Capture the network editor via Qt widget grab
+            _capture_pane_tab_qt(network_editor, output_path, **_max_size_kw(cap))
+            # What the image shows, read before the editor can go back.
+            visible_bounds = None
+            with contextlib.suppress(Exception):
+                visible_bounds = _bounds_list(network_editor.visibleBounds())
+    except Exception:
+        _restore_editor()
+        raise
 
     result = {
         "success": True,
@@ -1122,9 +2195,17 @@ def capture_network_editor(
         "file_exists": os.path.isfile(output_path),
         "visible_bounds": visible_bounds,
     }
+    if network is not None:
+        result["network_path"] = network.path()
+    if frame == "all":
+        result["framed"] = "all"
+        result["items_bounds"] = (
+            [round(v, 3) for v in framed_all] if framed_all is not None else None
+        )
     if node_bounds is not None:
         result["node_bounds"] = node_bounds
     _set_node_in_view(result)
+    result.update(_readability(network_editor, visible_bounds))
     return result
 
 
@@ -1147,26 +2228,36 @@ def _set_node_in_view(result: dict) -> None:
 
 
 def _recapture_network_editor(data: dict, params: dict) -> dict:
-    """Capture the editor again once Houdini has repainted it.
+    """Capture the editor again once Houdini has repainted it, then put it back.
 
     The handler's own grab ran in the same main-thread call that moved the
     editor, before Houdini could redraw it, and on Houdini 22 that image
     showed the editor's previous framing (measured on 22.0.508: framing OUT
     then CONTROLS gave CONTROLS then OUT). The dispatcher calls this after
-    leaving the main thread idle, so this grab shows what was asked for.
+    leaving the main thread idle, so this grab shows what was asked for. The
+    editor goes back to where the capture found it only after this grab.
     """
-    network_editor = next(
-        (tab for tab in hou.ui.paneTabs() if tab.type() == hou.paneTabType.NetworkEditor),
-        None,
-    )
-    if network_editor is None:
+    try:
+        network_editor = next(
+            (tab for tab in hou.ui.paneTabs() if tab.type() == hou.paneTabType.NetworkEditor),
+            None,
+        )
+        if network_editor is None:
+            return data
+        _capture_pane_tab_qt(
+            network_editor, data["output_path"], **_max_size_kw(params.get("max_size"))
+        )
+        with contextlib.suppress(Exception):
+            data["visible_bounds"] = _bounds_list(network_editor.visibleBounds())
+        data["file_exists"] = os.path.isfile(data["output_path"])
+        _set_node_in_view(data)
         return data
-    _capture_pane_tab_qt(network_editor, data["output_path"])
-    with contextlib.suppress(Exception):
-        data["visible_bounds"] = _bounds_list(network_editor.visibleBounds())
-    data["file_exists"] = os.path.isfile(data["output_path"])
-    _set_node_in_view(data)
-    return data
+    finally:
+        failed = _restore_editor()
+        if failed is not None:
+            data["editor_restored"] = not failed
+            if failed:
+                data["editor_not_restored"] = failed
 
 
 ###### viewport.set_current_network

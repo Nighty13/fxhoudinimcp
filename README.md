@@ -45,7 +45,7 @@
 
 An [MCP](https://modelcontextprotocol.io/) server for [SideFX Houdini](https://www.sidefx.com/): it lets an AI assistant build networks, set up simulations, inspect USD stages and render, through Houdini's own Python API. It works with any MCP client: Claude, Codex, Copilot, Gemini, Cursor, Windsurf, VS Code, Cline and others.
 
-**218 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
+**221 tools**, **8 resources**, and **9 prompts** serving **37 written workflow guides** out of the box.
 
 <!-- --8<-- [start:features] -->
 | Category | Tools | Description |
@@ -88,7 +88,7 @@ flowchart LR
 
     subgraph MCP[" ⚡ FXHoudini MCP Server "]
         direction TB
-        B1("🔧 218 tools")
+        B1("🔧 221 tools")
         B2("📦 8 Resources")
         B3("💬 9 Prompts")
     end

@@ -16,6 +16,7 @@ from typing import Any
 import hou
 
 # Internal
+from fxhoudinimcp_server.config import place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
 from fxhoudinimcp_server.ui import focus_network_editor as _focus_network_editor
@@ -108,6 +109,149 @@ def _check_channel_paths(vex_code: str) -> list[str]:
             "Absolute paths break when nodes are renamed or moved."
         )
     return warnings
+
+
+###### VEX lint: traps that cost a verify round each (agent-ux-notes 4d#4, 4f#12, 4k#4)
+
+# Functions whose return type VEX picks from the receiving side: used where
+# nothing fixes that type, the call is "ambiguous".
+_GENERIC_READS = ("point", "prim", "vertex", "detail", "primuv", "attrib")
+_RE_GENERIC_CALL = re.compile(r"\b(" + "|".join(_GENERIC_READS) + r")\s*\(")
+_RE_COMPARISON = re.compile(r"(?:[<>]=?|[!=]=)$")
+_RE_COMPARISON_AFTER = re.compile(r"^(?:[<>]=?|[!=]=)(?![<>=])")
+_TYPED_PREFIX = re.compile(r"\b(?:int|float|vector2?|vector4|matrix[23]?|string|dict)\s*$")
+_RE_ARRAY_CALL = re.compile(
+    r"\b(append|push|insert|setpointattrib|setprimattrib|setdetailattrib|"
+    r"setvertexattrib|setattrib)\s*\("
+)
+_RE_FOREACH_LITERAL = re.compile(r"\bforeach\s*\([^;]*;\s*(?:array\s*\(|\{)")
+_RE_ADDPOINT = re.compile(r"\baddpoint\s*\(")
+_RE_READ_INPUT0 = re.compile(r"\b(?:point|npoints|pointattrib)\s*\(\s*0\s*[,)]")
+_RE_RANGE = re.compile(r"(?<![\w.@])range\s*\(")
+
+_HINT_AMBIGUOUS = (
+    "{name}() at line {line} has no type to return here ({where}): VEX cannot pick the "
+    "overload and reports an ambiguous call. Assign it to a typed variable first "
+    "(float v = {name}(...);) or prefix the type (f@, v[]@...)."
+)
+_HINT_FOREACH = (
+    "foreach over an array literal at line {line}: VEX cannot type the literal and fails "
+    "with the cryptic 'uninitialized __impl_foreach_end'. Store it in a typed array first: "
+    "int items[] = array(a, b); foreach (int x; items) ..."
+)
+_HINT_ADDPOINT = (
+    "addpoint() creates points that point(0, ...) / npoints(0) cannot see in the same cook: "
+    "input 0 is the geometry as it came in. Keep the new points' values in local "
+    "variables or arrays."
+)
+_HINT_RANGE = "VEX has no range(); use for (int i = 0; i < n; i++)."
+
+
+def _strip_comments(code: str) -> str:
+    """*code* with // and /* */ comments blanked, line numbers kept."""
+    code = re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), code, flags=re.S)
+    return re.sub(r"//[^\n]*", "", code)
+
+
+def _close_paren(code: str, open_index: int) -> int:
+    """Index of the ')' matching the '(' at *open_index*; len(code) if unbalanced."""
+    depth = 0
+    for index in range(open_index, len(code)):
+        char = code[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(code)
+
+
+def _top_level_args(text: str) -> list[str]:
+    """Comma-split *text* (a call's arguments) at depth 0."""
+    args, depth, start = [], 0, 0
+    for index, char in enumerate(text):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append(text[start:index])
+            start = index + 1
+    args.append(text[start:])
+    return [a.strip() for a in args]
+
+
+def vex_lint(code: str | None) -> list[str]:
+    """Plain-English hints for the VEX traps an agent hit again and again.
+
+    Heuristics, not a parser: a hint is a reason to look, not an error.
+    """
+    if not code:
+        return []
+    text = _strip_comments(code)
+    hints: list[str] = []
+
+    def line_of(index: int) -> int:
+        return text.count("\n", 0, index) + 1
+
+    for match in _RE_GENERIC_CALL.finditer(text):
+        name = match.group(1)
+        before = text[: match.start()].rstrip()
+        if _TYPED_PREFIX.search(before) or before.endswith(("@", ".")):
+            continue
+        end = _close_paren(text, match.end() - 1)
+        after = text[end + 1 :].lstrip()
+        if _RE_COMPARISON.search(before) or _RE_COMPARISON_AFTER.match(after):
+            hint = _HINT_AMBIGUOUS.format(
+                name=name, line=line_of(match.start()), where="a comparison"
+            )
+            if hint not in hints:
+                hints.append(hint)
+    for match in _RE_ARRAY_CALL.finditer(text):
+        end = _close_paren(text, match.end() - 1)
+        args = _top_level_args(text[match.end() : end])
+        # append(arr, point(...)), setpointattrib(0, "n", pt, point(...)).
+        value = next((a for a in args[1:] if _RE_GENERIC_CALL.match(a)), None)
+        if value is not None:
+            name = _RE_GENERIC_CALL.match(value).group(1)
+            hint = _HINT_AMBIGUOUS.format(
+                name=name,
+                line=line_of(match.start()),
+                where=f"an argument of {match.group(1)}()",
+            )
+            if hint not in hints:
+                hints.append(hint)
+    for match in _RE_FOREACH_LITERAL.finditer(text):
+        hints.append(_HINT_FOREACH.format(line=line_of(match.start())))
+    if _RE_ADDPOINT.search(text) and _RE_READ_INPUT0.search(text):
+        hints.append(_HINT_ADDPOINT)
+    if _RE_RANGE.search(text):
+        hints.append(_HINT_RANGE)
+    return hints
+
+
+def error_hints(errors: list) -> list[str]:
+    """Plain-English readings of VEX compiler messages that say little on their own."""
+    hints: list[str] = []
+    joined = "\n".join(str(e) for e in errors or [])
+    if "__impl_foreach" in joined:
+        hints.append(
+            "'__impl_foreach_end' means a foreach whose array VEX could not type, "
+            "usually an array literal: store it in a typed array variable first."
+        )
+    if re.search(r"[Aa]mbiguous call", joined):
+        hints.append(
+            "An ambiguous call is a function whose return type VEX picks from its use "
+            "(point(), prim(), detail()...): assign it to a typed variable first."
+        )
+    return hints
+
+
+def _hints_for(code: str | None, errors: list) -> list[str]:
+    found = vex_lint(code)
+    found += [h for h in error_hints(errors) if h not in found]
+    return found
 
 
 ###### vex.create_wrangle
@@ -238,6 +382,9 @@ def set_wrangle_code(node_path: str, vex_code: str | None = None, edits: Any = N
             found exactly once; one bad edit writes nothing. A block of a
             130-line snippet needed the whole text, or execute_python.
             The reply then names the changed lines, not the code.
+
+    Neither form echoes the code: the reply carries `line_count`,
+    `char_count`, `vex_valid` / `vex_errors` and lint `hints`.
     """
     node = _get_node(node_path)
 
@@ -259,21 +406,25 @@ def set_wrangle_code(node_path: str, vex_code: str | None = None, edits: Any = N
 
     snippet_parm.set(vex_code)
 
+    # The snippet is the caller's own text: a 200-line wrangle echoed back
+    # was ~10k tokens (agent-ux-notes 4f#5). Counts say it landed.
     result = {
         "success": True,
         "node_path": node.path(),
-        "vex_code": vex_code,
+        "line_count": len(vex_code.splitlines()),
+        "char_count": len(vex_code),
         "channel_prefix": "../",
     }
     if applied is not None:
-        del result["vex_code"]
         result["edits_applied"] = applied
-        result["line_count"] = len(vex_code.splitlines())
     result.update(_validate_vex_quick(node))
 
     path_warnings = _check_channel_paths(vex_code)
     if path_warnings:
         result.setdefault("vex_warnings", []).extend(path_warnings)
+    hints = _hints_for(vex_code, result.get("vex_errors") or [])
+    if hints:
+        result["hints"] = hints
 
     return result
 
@@ -376,12 +527,115 @@ def create_vex_expression(
 ###### vex.validate_vex
 
 
-def validate_vex(node_path: str) -> dict:
+# context -> wrangle node type a scratch check is made of.
+_SCRATCH_TYPES = {
+    "sop": "attribwrangle",
+    "attrib": "attribwrangle",
+    "attribwrangle": "attribwrangle",
+    "volume": "volumewrangle",
+    "volumewrangle": "volumewrangle",
+}
+
+
+def _no_undo():
+    """hou.undos.disabler(), so a scratch node leaves no undo entries behind."""
+    with contextlib.suppress(Exception):
+        return hou.undos.disabler()
+    return contextlib.nullcontext()
+
+
+def _scratch_wrangle(near: hou.Node | None, type_name: str | None) -> tuple[hou.Node, hou.Node]:
+    """(wrangle, node to destroy): next to *near* with its inputs, or in a scratch /obj geo.
+
+    Next to the wrangle it would replace, relative ch() paths and the inputs'
+    attributes are what the real node sees; a locked parent falls back to
+    the scratch container.
+    """
+    if near is not None:
+        with contextlib.suppress(Exception):
+            wrangle = near.parent().createNode(type_name or near.type().name(), "__fxh_vex_check")
+            for index, source in enumerate(near.inputs()):
+                if source is not None:
+                    with contextlib.suppress(Exception):
+                        wrangle.setInput(index, source)
+            place_new_node(wrangle)  # beside the user's nodes, never on top of one
+            return wrangle, wrangle
+    container = hou.node("/obj").createNode("geo", "__fxh_vex_scratch")
+    place_new_node(container)
+    wrangle = container.createNode(type_name or "attribwrangle", "__fxh_vex_check")
+    place_new_node(wrangle)
+    return wrangle, container
+
+
+def _validate_code(
+    code: str, node_path: str | None, run_over: str | None, context: str | None
+) -> dict:
+    """Compile *code* in a scratch wrangle that is destroyed afterwards."""
+    type_name = None
+    if context is not None:
+        type_name = _SCRATCH_TYPES.get(str(context).strip().lower())
+        if type_name is None:
+            raise ValueError(f"Unknown context {context!r}; known: {sorted(_SCRATCH_TYPES)}")
+    near = _get_node(node_path) if node_path else None
+    with _no_undo():
+        wrangle, scratch = _scratch_wrangle(near, type_name)
+        try:
+            wrangle.parm("snippet").set(code)
+            class_parm = wrangle.parm("class")
+            if class_parm is not None:
+                if run_over:
+                    class_parm.set(_resolve_class_value(wrangle, run_over))
+                elif near is not None and near.parm("class") is not None:
+                    class_parm.set(near.parm("class").eval())
+            checked = _validate_vex_quick(wrangle)
+            label = _reverse_class_label(wrangle) if class_parm is not None else None
+            scratch_path = wrangle.path()
+        finally:
+            with contextlib.suppress(Exception):
+                scratch.destroy()
+    errors = [str(e).replace(scratch_path, "<snippet>") for e in checked["vex_errors"]]
+    warnings = [str(w).replace(scratch_path, "<snippet>") for w in checked["vex_warnings"]]
+    warnings += _check_channel_paths(code)
+    result = {
+        "is_valid": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "hints": _hints_for(code, errors),
+        "line_count": len(code.splitlines()),
+        "checked_in": "next to " + near.path() if near is not None else "scratch network",
+    }
+    if label is not None:
+        result["run_over"] = label
+    result["message"] = (
+        "VEX code is valid." if not errors else f"VEX code has {len(errors)} error(s)."
+    )
+    return result
+
+
+def validate_vex(
+    node_path: str | None = None,
+    code: str | None = None,
+    run_over: str | None = None,
+    context: str | None = None,
+) -> dict:
     """Validate VEX code by cooking the node and checking for errors.
 
+    With *code*, the snippet is compiled in a scratch wrangle that is
+    destroyed afterwards (no undo entries), before it lands anywhere: next to
+    *node_path* with its inputs and run-over class when one is given, else in
+    a scratch network. The reply never echoes the code.
+
     Args:
-        node_path: Path to the wrangle node to validate.
+        node_path: Path to the wrangle node to validate (or, with code, the
+            wrangle the code is meant for).
+        code: A snippet to compile instead of the node's own.
+        run_over: With code: "Points", "Primitives", "Detail", ...
+        context: With code: "sop" (attribwrangle, default) or "volume".
     """
+    if code is not None:
+        return _validate_code(str(code), node_path, run_over, context)
+    if not node_path:
+        raise ValueError("Give node_path (a wrangle to check) or code (a snippet to compile).")
     node = _get_node(node_path)
 
     # Read the current VEX code for reference
@@ -424,6 +678,9 @@ def validate_vex(node_path: str) -> dict:
 
     if vex_code is not None:
         result["vex_code"] = vex_code
+    hints = _hints_for(vex_code, errors)
+    if hints:
+        result["hints"] = hints
 
     if is_valid:
         result["message"] = "VEX code is valid."

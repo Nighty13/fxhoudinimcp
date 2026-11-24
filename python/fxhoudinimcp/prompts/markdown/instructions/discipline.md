@@ -179,6 +179,20 @@ the alias so old scenes load, but prefer the current name:
 *   Top: mlregressiontrain (20.5-20.5) is now ml_trainregression (21.0+)
 <!-- END GENERATED: node domains -->
 
+## LESSONS FROM LIVE SESSIONS (each one cost rounds; heed them)
+
+*   VALIDATE WRANGLES BEFORE THEY LAND. `validate_vex(code=...)` compiles a snippet in a scratch wrangle and answers `vex_valid`, `vex_errors` and `hints` for known traps (ambiguous `point()`, `addpoint` + `point(0, ...)`, `foreach` over an array literal). `build_network(dry_run=True)` compiles every `snippet` too, and a build cooks wrangles off the display chain. `verify_network` lists wrangles that never cooked in `never_cooked` (not healthy); `force_cook=True` cooks them and for-each block ends.
+*   MEASURE, DON'T LOOK: `sample_volume(from_node=..., compare_to="P.y")` for anything placed on terrain (signed delta, worst points); `get_attrib_stats(group_by=...)` for per-row / per-piece numbers; `sweep_parameter` to see what a knob does (values restored after); `sim_report` for a sim per frame; `compare_snapshots(take, node_path=...)` then `restore` to measure at other settings without losing the user's values.
+*   THE USER EDITS TOO. A reply carrying `scene_changed_outside_mcp` lists what someone changed in Houdini since your last call: read those values before writing over them.
+*   VEX traps: always assign `point()`, `prim()` and `detail()` results to a typed variable before comparing, appending or passing them on (`vector p = point(0, "P", pt);`); the untyped call is an ambiguous overload. A point-class wrangle that reads `@primnum` gets garbage, not the point's primitive. In a detail wrangle, `point(0, ...)` reads the input, never points `addpoint` created in the same cook. `range()` does not exist in VEX, and `foreach` over an array literal fails with a cryptic `__impl_foreach_end` error: put the array in a typed variable first.
+*   PARAMETER SEMANTICS SURPRISE: BUILD, THEN MEASURE. A noise amplitude of 140 gave about 45 m of relief. Never reason from a parameter's name to a result: set it, cook, and read the number (`get_volume_info`, `get_bounding_box`, `get_attrib_stats`).
+*   MEASURE AGAINST WHAT THE FINAL GEOMETRY CAN REPRESENT. A heightfield cannot hold a vertical wall or a feature narrower than about two cells. Before calling a difference a regression, compare it with the cell size (`get_volume_info` voxel size) or the mesh's sample spacing.
+*   AFTER ANY CURVE-DRIVEN BUILD, CHECK THE MIN/MAX SPREAD OF THE DRIVEN ATTRIBUTE. A river whose `get_bounding_box` showed y-min == y-max was perfectly flat: the bed profile never reached the output. One call, before any screenshot.
+*   WHEN MIGRATING TO A NEW METHOD, LIST EVERY CONSUMER OF THE OLD ONE AND CHECK EACH. "Water now comes from the lattice" was reported while its width still came from the old per-row terrain search. A migration is done when no consumer reads the old structure.
+*   `execute_python` runs in a fresh namespace per call: nothing defined in one call exists in the next. Re-import and re-fetch nodes every time.
+*   To show the user where their controls are, `set_selection([node])` and then `capture_screenshot(pane_name=<the Parameter pane's name>)`; that image is the proof, not a description of the interface.
+*   HDA values the user tunes on an instance are not the definition's defaults, and Houdini Engine cooks the defaults. Promote tuned values into the definition before calling a game-engine asset done (`get_workflow_guide("game_assets")`).
+
 ## WORKFLOW GUIDES — `get_workflow_guide(topic)` before designing a setup you have not built before
 
 This server ships a written guide per subject, each one distilled from that
@@ -190,6 +204,7 @@ slash commands; the tool is the way YOU fetch one.
 *   `simulation_setup(sim_type)` dispatches per solver: pyro (also smoke, fire, explosion), fluid (flip, liquid, water, whitewater), vellum (cloth, softbody), destruction (rbd, fracture, bullet), mpm (sand, snow). Anything else gets the general dynamics guide.
 *   Named prompts: `procedural_modeling_workflow`, `usd_scene_assembly`, `pdg_pipeline`, `hda_development`, `copernicus_workflow`, `heightfield_terrain`, `debug_scene`.
 *   `houdini_workflow(topic)` serves any other subject by help-scope name: character, render, shade, crowds, copy, props, dopparticles, io, anim, ocean, grains, muscles, finiteelements, feathers, fur, ml, composite, heightfields_cop.
+*   Game-engine (Unreal Engine 5.8) delivery: unreal_landscape (also ue, unreal, landscape), game_assets (also game, houdini_engine), vat (also vertex_animation), niagara, roads_rivers (also river, road), mesh_qa (also qa). They end with a Verify section of numeric checks to run before anything leaves Houdini.
 
 Two of those guides exist mainly to stop you building on a dead end, so heed them:
 character work belongs in KineFX because the object-level bone system is

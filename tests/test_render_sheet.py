@@ -50,7 +50,7 @@ async def test_the_result_line_is_returned_and_the_snapshot_removed(bridge, monk
     _, snapshot = bridge
     line = json.dumps({"output_path": "sheet.png", "frames": [1, 6]})
     _child_prints(monkeypatch, "noise\n__MCP_RESULT__ " + line + "\n")
-    result = await rendering.render_sheet(MagicMock(), start=1, end=6, step=5)
+    result = await rendering.render_sheet(MagicMock(), start=1, end=6, step=5, hython=True)
     assert result["frames"] == [1, 6] and result["hip_file"] == "C:/shots/a.hip"
     assert not snapshot.exists()
 
@@ -59,11 +59,11 @@ async def test_the_result_line_is_returned_and_the_snapshot_removed(bridge, monk
 async def test_a_child_error_is_raised(bridge, monkeypatch):
     _child_prints(monkeypatch, "__MCP_RESULT__ " + json.dumps({"error": "Pass camera=: none"}), 2)
     with pytest.raises(ValueError, match="Pass camera"):
-        await rendering.render_sheet(MagicMock(), start=1, end=2)
+        await rendering.render_sheet(MagicMock(), start=1, end=2, hython=True)
 
 
 @pytest.mark.asyncio
 async def test_a_crash_shows_the_tail_of_its_output(bridge, monkeypatch):
     _child_prints(monkeypatch, "loading\nFatal error: Segmentation fault\n", 139)
     with pytest.raises(RuntimeError, match="code 139:\nloading\nFatal error"):
-        await rendering.render_sheet(MagicMock(), start=1, end=2)
+        await rendering.render_sheet(MagicMock(), start=1, end=2, hython=True)

@@ -388,7 +388,7 @@ class TestNodeCardIntrospection:
         # returning 80 reads as "that is all of them".
         card = call("graph.get_node_card", node_type="pyrosolver", context="Sop")
         assert card["parms_truncated"] is True
-        assert card["parms_matched"] > card["parm_count"]
+        assert card["parms_matched"] > card["parms_listed"]
 
     def test_hidden_parameters_are_no_longer_dropped_silently(self, call):
         """Hidden parameters are settable, so omitting them answered "no such

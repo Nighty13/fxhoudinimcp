@@ -199,7 +199,56 @@ def place_new_node(node: hou.Node) -> None:
     # Placement is cosmetic -- never fail a create because of it.
     with contextlib.suppress(Exception):
         node.moveToGoodPosition(**_PLACE_KWARGS)
+    with contextlib.suppress(Exception):
+        _clear_overlap(node)
     mark_placed(node)
+
+
+# Footprint used for overlap checks when a node cannot say its size.
+_NODE_W, _NODE_H = 1.0, 0.3
+
+
+def _overlaps(position, size, other_position, other_size) -> bool:
+    return (
+        abs(position[0] - other_position[0]) < (size[0] + other_size[0]) / 2
+        and abs(position[1] - other_position[1]) < (size[1] + other_size[1]) / 2
+    )
+
+
+def _size_of(node) -> tuple[float, float]:
+    with contextlib.suppress(Exception):
+        width, height = node.size()
+        return float(width), float(height)
+    return _NODE_W, _NODE_H
+
+
+def _clear_overlap(node, step: float = 1.5, tries: int = 20) -> None:
+    """Shift the NEW node sideways until it sits on no sibling.
+
+    moveToGoodPosition put build_network nodes exactly on top of existing
+    ones twice in one session (notes 4i #5). Only *node* moves: the user's
+    nodes keep their places.
+    """
+    parent = node.parent()
+    if parent is None:
+        return
+    others = [
+        (tuple(child.position()), _size_of(child))
+        for child in parent.children()
+        if child.path() != node.path()
+    ]
+    if not others:
+        return
+    size = _size_of(node)
+    x, y = tuple(node.position())
+    for _ in range(tries):
+        if not any(_overlaps((x, y), size, pos, other) for pos, other in others):
+            break
+        x += step
+    else:
+        return
+    if (x, y) != tuple(node.position()):
+        node.setPosition((x, y))
 
 
 def place_new_nodes(nodes) -> None:

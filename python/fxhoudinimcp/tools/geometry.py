@@ -378,6 +378,12 @@ async def get_attrib_stats(
     group: str | None = None,
     unique: bool = False,
     distance_to: str | None = None,
+    group_by: str | None = None,
+    buckets: int | None = None,
+    bucket_size: float | None = None,
+    reduce: list[str] | None = None,
+    max_groups: int | None = None,
+    list_if_count_below: int | None = None,
 ) -> dict:
     """Aggregate statistics for numeric attributes: min, max, mean, sum.
 
@@ -412,6 +418,22 @@ async def get_attrib_stats(
             particles crawling on or hovering over a mesh. Point class; the
             scene is not changed. Both are taken in their own SOP space:
             object transforms are not applied, so use it within one object.
+        group_by: Aggregate attribs per value of this attribute (int or
+            string; a float groups per exact value, or per bucket with
+            buckets/bucket_size; a vector needs a component: "P.y",
+            "uv[0]"). Answers `group_by.groups`: key (or range), count and,
+            per attribute, the reduce values (per component for vectors).
+            "Water width per row" = group_by="s", attribs=["uv"], spread.
+        buckets: Split a numeric group_by into this many equal-width bins.
+        bucket_size: Or into bins of this width, aligned to 0.
+        reduce: Any of count, min, max, mean, spread (max - min), sum,
+            median. Default: min, max, mean, spread.
+        max_groups: Groups listed (default 50); a numeric key with more
+            distinct values is bucketed into 10.
+        list_if_count_below: When the elements (after group) are at most
+            this many (cap 500), also list them as `elements`: index and the
+            values of attribs. Three waterfall points come back as three
+            positions instead of a mean.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"attrib_class": attrib_class}
@@ -421,6 +443,16 @@ async def get_attrib_stats(
         params["unique"] = True
     if distance_to is not None:
         params["distance_to"] = distance_to
+    for key, value in (
+        ("group_by", group_by),
+        ("buckets", buckets),
+        ("bucket_size", bucket_size),
+        ("reduce", reduce),
+        ("max_groups", max_groups),
+        ("list_if_count_below", list_if_count_below),
+    ):
+        if value is not None:
+            params[key] = value
     for key, value in (
         ("node_path", node_path),
         ("attribs", attribs),
@@ -443,6 +475,7 @@ async def get_volume_info(
     max_volumes: int = 24,
     threshold: float | None = None,
     bins: int | list[float] = 0,
+    compact: bool = False,
 ) -> dict:
     """Per-volume name, resolution, active voxels, value range, mean and sum.
 
@@ -463,6 +496,12 @@ async def get_volume_info(
         max_volumes: Cap on volumes reported.
         threshold: Split the voxels at this value and box the ones above it.
         bins: Histogram bin count, or a list of bin edges.
+        compact: One row per volume instead of an entry each: `columns`
+            (name, res, bbox_min, bbox_max, voxel, min, max, mean; plus p50
+            and p95 when threshold/bins read the voxels, share_above with a
+            threshold) and `rows`. Use it for "which layers, what range" on a
+            multi-layer heightfield (~3k chars per call as entries). Off by
+            default: the full entries carry the voxel centres and histogram.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"node_path": node_path, "max_volumes": max_volumes}
@@ -470,19 +509,27 @@ async def get_volume_info(
         params["threshold"] = threshold
     if bins:
         params["bins"] = bins
+    if compact:
+        params["compact"] = True
     return await bridge.execute("geometry.get_volume_info", params)
 
 
 @mcp.tool()
 async def sample_volume(
     ctx: Context,
-    node_path: str,
-    fields: list[str],
+    node_path: str | None = None,
+    fields: list[str] | None = None,
     positions: list[list[float]] | None = None,
     from_node: str | None = None,
     limit: int = 1000,
     bins: int | list[float] = 0,
     threshold: float | None = None,
+    node_paths: list[str] | None = None,
+    compare_to: str | float | None = None,
+    tolerance: float = 0.0,
+    worst: int = 5,
+    attribs: list[str] | None = None,
+    include_values: bool | None = None,
 ) -> dict:
     """Read named volume fields at world positions, or at another SOP's points.
 
@@ -490,25 +537,61 @@ async def sample_volume(
     with from_node, and adds no node to the scene. A VDB SDF reads its
     background (the band width) outside its narrow band, not the distance.
 
+    Placement on terrain is one call too. "Water points against the terrain
+    under them" is node_path=<terrain>, from_node=<water>, compare_to="P.y":
+    the per-point signed delta height - P.y (positive = the point is under
+    the terrain surface, negative = above it), with percentiles, counts
+    beyond tolerance, a histogram and the worst points on each side. Two
+    terrains at the same points: node_paths=[A, B], compare_to=B (A - B).
+
     Args:
-        node_path: SOP holding the volumes.
-        fields: Volume names (the name attribute), e.g. ["density"].
+        node_path: SOP holding the volumes (or a heightfield).
+        fields: Volume names (the name attribute), e.g. ["density"]. Omit
+            for ["height"], a heightfield's elevation layer.
         positions: [[x, y, z], ...] in world space.
         from_node: SOP whose points are the positions, instead of positions.
-        limit: Values are returned up to this many positions; the summary always is.
-        bins: Histogram bin count, or a list of bin edges, for the summary.
+        limit: Cap on per-point values returned. Without compare_to, values
+            come back when there are at most this many positions; the
+            summary always does.
+        bins: Histogram bin count, or a list of bin edges, for the summary
+            (and for the delta histogram, 8 bins when omitted).
         threshold: Count the samples above this value.
+        node_paths: Several volume/heightfield nodes sampled at the same
+            points, instead of node_path: one column each, keyed by node
+            path (path:field with several fields).
+        compare_to: Reference for a per-point signed delta (column -
+            reference) of every other column: "P.y" or any point attribute
+            or component of from_node ("rest.y", "uv[0]"), a number, or a
+            sampled column (its key, or its node's name). Answers `compare`:
+            min/max/mean/mean_abs, percentiles 1/5/50/95/99, above/below/
+            within tolerance, histogram, worst_above / worst_below.
+        tolerance: A |delta| at or under this counts as within.
+        worst: Points listed on each side (max 50), with point number,
+            delta, value, reference, P and attribs.
+        attribs: Point attributes of from_node to show on the worst points.
+        include_values: True for the per-point values (and deltas) up to
+            limit; False for none. Default: off with compare_to.
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {"node_path": node_path, "fields": fields, "limit": limit}
-    if positions is not None:
-        params["positions"] = positions
-    if from_node is not None:
-        params["from_node"] = from_node
+    params: dict[str, Any] = {"limit": limit}
+    for key, value in (
+        ("node_path", node_path),
+        ("node_paths", node_paths),
+        ("fields", fields),
+        ("positions", positions),
+        ("from_node", from_node),
+        ("threshold", threshold),
+        ("compare_to", compare_to),
+        ("attribs", attribs),
+        ("include_values", include_values),
+    ):
+        if value is not None:
+            params[key] = value
     if bins:
         params["bins"] = bins
-    if threshold is not None:
-        params["threshold"] = threshold
+    if compare_to is not None:
+        params["tolerance"] = tolerance
+        params["worst"] = worst
     return await bridge.execute("geometry.sample_volume", params)
 
 
@@ -544,3 +627,58 @@ async def compare_volumes(
     if against_node is not None:
         params["against_node"] = against_node
     return await bridge.execute("geometry.compare_volumes", params)
+
+
+@mcp.tool()
+async def sim_report(
+    ctx: Context,
+    node_path: str,
+    frames: list[float],
+    attribs: list[str] | None = None,
+    flags: list[str] | None = None,
+    rest_node: str | None = None,
+    displacement: bool = True,
+    match_by: str = "auto",
+    percentiles: list[float] | None = None,
+) -> dict:
+    """A simulation judged by numbers: one row per frame, in one call.
+
+    For each frame (cooked in increasing order, the current frame put back):
+    point count; displacement from rest (percentiles and max); percentiles
+    and max of each attribs entry (a vector by its length: "v" gives speed
+    as v_len_p99); and for each flags entry the count and percentage of
+    points where it is non-zero ("broken" gives broken_pct). "broken %, p99
+    speed at f60/f160/f240" is sim_report(node, [60, 160, 240],
+    attribs=["v"], flags=["broken"]). Answers `columns` + `rows`; a frame
+    that fails is listed in `errors`, not a failed call.
+
+    Args:
+        node_path: SOP to measure (a solver's output, a cache).
+        frames: Frames to report.
+        attribs: Point attributes to summarise, e.g. ["v"] (speed), ["age"].
+        flags: Point attributes counted as booleans, e.g. ["broken"].
+        rest_node: SOP whose points are the rest positions. Default: the
+            first reported frame's points.
+        displacement: Report the distance from rest (needs P).
+        match_by: How points meet their rest: "auto" (id, else a name that
+            is unique per point as packed pieces have, else point number),
+            "id", "name" or "ptnum".
+        percentiles: Default [50, 95, 99].
+    """
+    bridge = _get_bridge(ctx)
+    params: dict[str, Any] = {
+        "node_path": node_path,
+        "frames": frames,
+        "displacement": displacement,
+        "match_by": match_by,
+    }
+    for key, value in (
+        ("attribs", attribs),
+        ("flags", flags),
+        ("rest_node", rest_node),
+        ("percentiles", percentiles),
+    ):
+        if value is not None:
+            params[key] = value
+    # Every frame of a simulation cooks as long as it takes.
+    return await bridge.execute("geometry.sim_report", params, timeout=NO_TIMEOUT)

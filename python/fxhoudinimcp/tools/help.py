@@ -97,7 +97,11 @@ async def get_workflow_guide(ctx: Context, topic: str, description: str = "") ->
         topic: Help scope name or common alias: pyro, fluid (flip, water,
             whitewater), vellum (cloth), destruction (rbd), mpm (sand, snow),
             ocean, solaris, tops, model, copy, render, shade, character,
-            crowds, heightfields, copernicus, assets, troubleshooting, dyno.
+            crowds, heightfields, copernicus, assets, troubleshooting, dyno,
+            discipline. Unreal Engine / game delivery: unreal_landscape (ue,
+            unreal, landscape), game_assets (game, houdini_engine), vat
+            (vertex_animation), niagara, roads_rivers (river, road), mesh_qa
+            (qa).
         description: What you are trying to build, for the guide's framing.
     """
     # Internal

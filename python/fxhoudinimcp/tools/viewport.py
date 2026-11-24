@@ -170,6 +170,8 @@ async def frame_all(
     pane_name: str | None = None,
     node_paths: list[str] | None = None,
     bounds: list[float] | None = None,
+    direction: list[float] | str | None = None,
+    clearance: float | None = None,
 ) -> dict:
     """Frame all geometry in the viewport, or only some nodes or a box.
 
@@ -180,10 +182,24 @@ async def frame_all(
             it draws: a null its marker, a camera or a light its icon.
         bounds: Frame [xmin, ymin, zmin, xmax, ymax, zmax], world space. A
             point is framed as a 1-unit cube around it (`padded` in the reply).
+        direction: [rx, ry] degrees (rx < 0 looks down; ry 0 from the front,
+            90 from +X), or a name ('top', 'persp'...): a perspective view
+            from that angle, the distance computed from the bounds and the
+            field of view, so the eye is never inside them. `framing` in the
+            reply has the eye position.
+        clearance: With direction: keep the eye this far above the top of
+            the bounds (terrain); the view backs off or tilts down
+            (`framing.clearance_adjusted`).
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {}
-    for key, value in (("pane_name", pane_name), ("node_paths", node_paths), ("bounds", bounds)):
+    for key, value in (
+        ("pane_name", pane_name),
+        ("node_paths", node_paths),
+        ("bounds", bounds),
+        ("direction", direction),
+        ("clearance", clearance),
+    ):
         if value is not None:
             params[key] = value
     return await bridge.execute("viewport.frame_all", params)
@@ -192,11 +208,13 @@ async def frame_all(
 @mcp.tool()
 async def set_viewport_direction(
     ctx: Context,
-    direction: str | None = None,
+    direction: str | list[float] | None = None,
     pane_name: str | None = None,
     rotation: list[float] | None = None,
     pivot: list[float] | None = None,
     distance: float | None = None,
+    look_at: list[float] | None = None,
+    clearance: float | None = None,
 ) -> dict:
     """Set the viewport to a standard viewing direction, or place the free view.
 
@@ -205,12 +223,19 @@ async def set_viewport_direction(
     reply reads the view back. Looking through a camera, move the camera.
 
     Args:
-        direction: "front", "back", "top", "bottom", "left", "right", or "perspective".
+        direction: "front", "back", "top", "bottom", "left", "right", or
+            "perspective" ("persp"); or [rx, ry] degrees: a perspective view
+            framing the scene from that angle, distance from its bounds and
+            the field of view (the eye cannot land inside the geometry).
         pane_name: Pane tab name.
         rotation: [rx, ry, rz] degrees for the free view.
         pivot: [x, y, z] the free view orbits.
         distance: Distance of the free view from its pivot along its view
             axis (the dolly); a sideways pan is not counted in it.
+        look_at: [x, y, z] to aim a perspective view at (framing the scene
+            around it unless distance is given).
+        clearance: Keep the eye this far above the scene's top (terrain);
+            `framing.clearance_adjusted` says whether it backed off or tilted.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {}
@@ -220,6 +245,8 @@ async def set_viewport_direction(
         ("rotation", rotation),
         ("pivot", pivot),
         ("distance", distance),
+        ("look_at", look_at),
+        ("clearance", clearance),
     ):
         if value is not None:
             params[key] = value
@@ -232,8 +259,21 @@ async def capture_screenshot(
     output_path: str | None = None,
     pane_name: str | None = None,
     settle_seconds: float = 0,
+    node: str | None = None,
+    network: str | None = None,
+    camera: str | dict[str, Any] | None = None,
+    resolution: list[int] | None = None,
+    max_size: int | None = None,
+    frame: bool | None = None,
 ) -> dict:
     """Capture a screenshot of the viewport or a specific pane tab.
+
+    node/network/camera make the capture independent of where the user left
+    the viewer: they are set, captured and put back in one call (`restored`).
+    node= draws one SOP's or object's geometry on its own through a temporary
+    object merge, no display flag moved, framed on it. `drawn` in the reply
+    says what the image holds: display node or objects, prim/point counts,
+    prim types, guides switched off, the Visible Objects pattern, the camera.
 
     The image is written to disk only; open ``output_path`` with your file
     reader to look at it. Prefer get_geometry_info, get_node_info or
@@ -257,13 +297,30 @@ async def capture_screenshot(
         settle_seconds: Wait this long before capturing, without blocking
             Houdini, so a Karma viewport can converge after a change. Use
             this instead of a shell sleep between calls. Capped at 120.
+        node: Draw only this SOP or object, framed on it.
+        network: Show the viewer at this network for this capture only.
+        camera: A camera path to look through, or a view dict with any of
+            direction (name or [rx, ry]), rotation, pivot, distance,
+            look_at, clearance, as set_viewport_direction takes them.
+        resolution: [width, height] in pixels (Scene Viewer only).
+        max_size: Cap on the longer side in pixels; scales down, keeps shape.
+        frame: False keeps the view as it is with node= (default: frame it).
     """
     bridge = _get_bridge(ctx)
     if settle_seconds > 0:
         await asyncio.sleep(min(settle_seconds, 120))
     params: dict[str, Any] = {"output_path": capture_path(output_path, "screenshot")}
-    if pane_name is not None:
-        params["pane_name"] = pane_name
+    for key, value in (
+        ("pane_name", pane_name),
+        ("node", node),
+        ("network", network),
+        ("camera", camera),
+        ("resolution", resolution),
+        ("max_size", max_size),
+        ("frame", frame),
+    ):
+        if value is not None:
+            params[key] = value
     return await bridge.execute("viewport.capture_screenshot", params)
 
 
@@ -272,12 +329,18 @@ async def capture_network_editor(
     ctx: Context,
     output_path: str | None = None,
     node_path: str | None = None,
+    network_path: str | None = None,
+    frame: str | None = None,
+    max_size: int | None = None,
 ) -> dict:
     """Capture a screenshot of the network editor.
 
     With node_path the view is put on that node at once (no animated flight),
     and the reply says what the frame shows: visible_bounds, node_bounds and
-    node_in_view, all in network space.
+    node_in_view, all in network space. network_path + frame="all" shows a
+    whole network. The editor goes back to where the user had it afterwards
+    (`editor_restored`). `pixels_per_unit` / `readability_note` warn when
+    node names will be too small to read.
 
     The image is written to disk only; open ``output_path`` with your file
     reader to look at it. Prefer get_node_info or list_children for inspecting
@@ -287,11 +350,23 @@ async def capture_network_editor(
         output_path: Image file path; variables ($JOB) are expanded. Default: a
             new PNG in the temp dir.
         node_path: Node path to frame before capture.
+        network_path: Network to show (default: the node's, else the
+            editor's current one).
+        frame: "all" frames every node, box and note of the network; "node"
+            (the default with node_path) frames the node.
+        max_size: Cap on the longer side in pixels (scales down only; the
+            pane's own size is the upper limit).
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"output_path": capture_path(output_path, "network")}
-    if node_path is not None:
-        params["node_path"] = node_path
+    for key, value in (
+        ("node_path", node_path),
+        ("network_path", network_path),
+        ("frame", frame),
+        ("max_size", max_size),
+    ):
+        if value is not None:
+            params[key] = value
     return await bridge.execute("viewport.capture_network_editor", params)
 
 

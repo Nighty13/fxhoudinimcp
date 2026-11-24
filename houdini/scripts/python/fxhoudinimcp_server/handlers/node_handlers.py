@@ -743,10 +743,45 @@ def find_nodes(
 ###### nodes.list_node_types
 
 
+def _version_key(version: str) -> tuple:
+    """ "4.0" -> (4, 0); an unparsable part sorts low."""
+    parts = []
+    for part in str(version or "").split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            parts.append(-1)
+    return tuple(parts)
+
+
+def _latest_versions_only(entries: list) -> tuple[list, int]:
+    """Keep the newest version per (scope, namespace, name); count the rest.
+
+    *entries* are (type_name, node_type, record). An unversioned type and a
+    type whose name components cannot be read are always kept.
+    """
+    best: dict[tuple, tuple] = {}
+    kept_plain = []
+    for _type_name, node_type, record in entries:
+        try:
+            scope, namespace, name, version = node_type.nameComponents()
+        except Exception:
+            kept_plain.append(record)
+            continue
+        key = (scope, namespace, name)
+        current = best.get(key)
+        if current is None or _version_key(version) > _version_key(current[0]):
+            best[key] = (version, record)
+    kept = kept_plain + [record for _, record in best.values()]
+    kept.sort(key=lambda r: r["name"])
+    return kept, len(entries) - len(kept)
+
+
 def list_node_types(
     context: str,
     filter: str = None,
     limit: int = 200,
+    all_versions: bool = False,
     **_,
 ) -> dict:
     """List available node types in a given context category.
@@ -767,7 +802,7 @@ def list_node_types(
         )
 
     types_dict = category.nodeTypes()
-    type_list = []
+    entries = []
     for type_name, node_type in sorted(types_dict.items()):
         # Skip hidden/deprecated types
         try:
@@ -775,12 +810,15 @@ def list_node_types(
                 continue
         except Exception:
             pass
-        type_list.append(
-            {
-                "name": type_name,
-                "label": node_type.description(),
-            }
+        entries.append(
+            (type_name, node_type, {"name": type_name, "label": node_type.description()})
         )
+    hidden_versions = 0
+    if all_versions:
+        type_list = [record for _, _, record in entries]
+    else:
+        # Six VAT ROPs and four biome scatters: tokens, and a chance to pick an old one.
+        type_list, hidden_versions = _latest_versions_only(entries)
 
     if filter:
         f = filter.lower()
@@ -788,7 +826,9 @@ def list_node_types(
 
     total = len(type_list)
     type_list = type_list[:limit]
+    extra = {"older_versions_hidden": hidden_versions} if hidden_versions else {}
     return {
+        **extra,
         "context": context,
         "total_count": total,
         "returned_count": len(type_list),
@@ -2030,3 +2070,63 @@ def tidy_network(
 
 
 register_handler("nodes.tidy_network", tidy_network)
+
+
+###### nodes.collapse_to_subnet
+
+
+def _outputidx_of(node: Any) -> int:
+    with contextlib.suppress(Exception):
+        parm = node.parm("outputidx")
+        if parm is not None:
+            return int(parm.eval())
+    return 0
+
+
+def collapse_to_subnet(
+    parent_path: str,
+    node_names: list[str],
+    subnet_name: str | None = None,
+    **_: Any,
+) -> dict:
+    """Collapse *node_names* (children of *parent_path*) into one subnet.
+
+    Houdini's collapse adds an `output0` for the subnet's output. When the
+    collapsed nodes already hold an Output SOP for that index, the added one
+    is a second output 0 (notes 4b #5): it is removed and the explicit one
+    kept. Wires in and out of the selection are kept by Houdini.
+    """
+    parent = _get_node(parent_path)
+    if not node_names:
+        raise ValueError("node_names is empty: name the children to collapse.")
+    missing = [name for name in node_names if parent.node(str(name)) is None]
+    if missing:
+        raise ValueError(f"Not children of {parent_path}: {missing}")
+    chosen = [parent.node(str(name)) for name in node_names]
+    explicit = {
+        node.name(): _outputidx_of(node) for node in chosen if node.type().name() == "output"
+    }
+    subnet = parent.collapseIntoSubnet(chosen, subnet_name or "subnet1")
+    mark_placed(subnet)
+    removed = []
+    taken = set(explicit.values())
+    for child in list(subnet.children()):
+        if child.type().name() != "output" or child.name() in explicit:
+            continue
+        if _outputidx_of(child) in taken:
+            removed.append(child.name())
+            with contextlib.suppress(Exception):
+                child.destroy()
+    result: dict[str, Any] = {
+        "success": True,
+        "subnet": subnet.path(),
+        "children": [child.name() for child in subnet.children()],
+        "inputs": [i.path() if i is not None else None for i in subnet.inputs()],
+        "outputs": [o.path() for o in subnet.outputs()],
+    }
+    if removed:
+        result["removed_auto_outputs"] = removed
+    return result
+
+
+register_handler("nodes.collapse_to_subnet", collapse_to_subnet)

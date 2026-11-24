@@ -29,6 +29,12 @@ yes, copy. If only the renderer needs them, instance.
 - Per-copy attributes for instancing have their own conventions; `copy/instanceattrs` is the page, and guessing attribute names here is how instancing silently ignores your variation.
 - **Copy stamping is superseded** and must not be used. `copy/tutorial_stamping` exists for reading old scenes, not for authoring new ones. Use a for-each loop when copies must differ structurally.
 
+## Scattering and copy gotchas
+
+- copytopoints' `pivot` defaults to **centroid**: a tree copied by its centroid floats half its height. Use origin, with the source's base at the origin.
+- A string attribute (`name`) did not come through copytopoints in a live packed-RBD session. Check strings on the result with `get_attrib_stats(..., unique=True)` and set them after the copy when missing.
+- attribinterpolate after `scatter::2.0` only works when the scatter keeps the source primitive number and its parametric coordinates (enable those outputs on the scatter). Often simpler: in a point wrangle, `xyzdist()` to the surface for the prim and uv, then `primuv()` for the value.
+
 ## Order of work
 
 1. Decide copy versus instance before building, using the test above.

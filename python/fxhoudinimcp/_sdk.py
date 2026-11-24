@@ -24,14 +24,40 @@ try:
     # mcp >= 2.0
     from mcp.server.mcpserver import Context as Context
     from mcp.server.mcpserver import MCPServer as Server
+    from mcp.server.mcpserver.exceptions import ToolError as ToolError
 
     _SDK_V2 = True
 except ImportError:  # pragma: no cover - depends on the installed mcp
     # mcp 1.x
     from mcp.server.fastmcp import Context as Context
     from mcp.server.fastmcp import FastMCP as Server
+    from mcp.server.fastmcp.exceptions import ToolError as ToolError
 
     _SDK_V2 = False
+
+try:
+    from mcp.shared.exceptions import MCPError as MCPError
+except ImportError:  # pragma: no cover - mcp 1.x names it McpError
+    from mcp.shared.exceptions import McpError as MCPError
+
+
+def tool_error_from(exc: BaseException) -> Exception:
+    """The exception a tool raises so its message reaches the model.
+
+    mcp 2.x keeps the text of a ``ToolError`` and replaces every other
+    exception with a bare "Error executing tool <name>": the handlers' good
+    messages ("valid sections are ...", "op 3: unknown kind") never reached
+    the agent, which then guessed. A ``ToolError`` and a protocol ``MCPError``
+    pass through unchanged; anything else becomes a ``ToolError`` carrying
+    ``[code] message`` (FXHoudiniError) or ``TypeName: message``.
+    """
+    if isinstance(exc, ToolError | MCPError):
+        return exc
+    code = getattr(exc, "code", None)
+    message = str(exc) or type(exc).__name__
+    if isinstance(code, str) and code:
+        return ToolError(f"[{code}] {message}")
+    return ToolError(f"{type(exc).__name__}: {message}")
 
 
 def run_server(server, *, transport: str) -> None:
@@ -162,7 +188,10 @@ def forbid_unknown_arguments(server, name: str) -> None:
 
 __all__ = [
     "Context",
+    "MCPError",
     "Server",
+    "ToolError",
+    "tool_error_from",
     "build_server",
     "run_server",
     "report_progress",

@@ -73,8 +73,11 @@ async def set_wrangle_code(
     [{"old": "<exact text now in the snippet>", "new": "<its replacement>"}],
     applied in order; each `old` must occur exactly once (add a neighbouring
     line to make it unique), and one bad edit writes nothing. The reply then
-    gives `edits_applied` (line range and new text of each) instead of the
-    whole code.
+    gives `edits_applied` (line range and new text of each).
+
+    Neither form echoes the code back: the reply carries `line_count`,
+    `char_count`, `vex_valid` / `vex_errors` and, for known VEX traps, `hints`.
+    validate_vex(code=...) checks a snippet before writing it.
 
     Args:
         node_path: Path to the wrangle node.
@@ -130,11 +133,37 @@ async def create_vex_expression(
 
 
 @mcp.tool()
-async def validate_vex(ctx: Context, node_path: str) -> dict:
-    """Validate VEX code by cooking the node and checking for errors.
+async def validate_vex(
+    ctx: Context,
+    node_path: str | None = None,
+    code: str | None = None,
+    run_over: str | None = None,
+    context: str | None = None,
+) -> dict:
+    """Validate VEX: cook a wrangle, or compile a snippet before it lands.
+
+    With `code`, the snippet compiles in a scratch wrangle that is destroyed
+    afterwards: next to `node_path` (same inputs and run-over) when given,
+    else in a scratch network. The reply never echoes the code. `hints` names
+    known traps in plain English: point()/prim()/detail() with no type to
+    return (in a comparison, append(), set*attrib()), foreach over an array
+    literal (the cryptic "__impl_foreach_end"), point(0, ...) reading input
+    points that addpoint() in the same snippet cannot add to, range().
 
     Args:
-        node_path: Path to the wrangle node.
+        node_path: The wrangle to validate; with code, the wrangle it is for.
+        code: VEX snippet to compile instead of the node's own.
+        run_over: With code: "Points", "Primitives", "Vertices", "Detail", "Numbers".
+        context: With code: "sop" (attribwrangle, default) or "volume" (volumewrangle).
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute("vex.validate_vex", {"node_path": node_path})
+    payload: dict[str, Any] = {}
+    if node_path is not None:
+        payload["node_path"] = node_path
+    if code is not None:
+        payload["code"] = code
+    if run_over is not None:
+        payload["run_over"] = run_over
+    if context is not None:
+        payload["context"] = context
+    return await bridge.execute("vex.validate_vex", payload)

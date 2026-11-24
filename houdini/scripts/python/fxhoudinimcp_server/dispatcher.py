@@ -26,7 +26,7 @@ try:
 except ImportError:
     HAS_HDEFEREVAL = False
 
-from fxhoudinimcp_server import dialogs
+from fxhoudinimcp_server import dialogs, watch
 from fxhoudinimcp_server.errors import readable_message
 
 logger = logging.getLogger(__name__)
@@ -302,14 +302,26 @@ def dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
     start_time = time.time()
 
     def _execute():
+        # What the user changed since the previous call, taken before this
+        # call's own edits (which the watcher ignores anyway).
+        outside = None
+        with contextlib.suppress(Exception):
+            outside = watch.take_changes()
         try:
-            with _undo_group(command):
-                result = handler(**params)
+            watch.begin_call()
+            try:
+                with _undo_group(command):
+                    result = handler(**params)
+            finally:
+                with contextlib.suppress(Exception):
+                    watch.end_call(params)
             ignored = _ignored_arguments(handler, params)
             if ignored and isinstance(result, dict):
                 # Handlers take **_, so a misspelled argument used to vanish and the
                 # call quietly did something else (parm_names -> every parm).
                 result["ignored_arguments"] = ignored
+            if outside and isinstance(result, dict):
+                result["scene_changed_outside_mcp"] = outside
             return {"status": "success", "data": result}
         except TypeError as e:
             # A signature mismatch is Python talking about itself: "log_status()

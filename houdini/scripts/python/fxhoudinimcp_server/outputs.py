@@ -216,14 +216,130 @@ def flat_images(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> li
     return flat
 
 
+#: Node types whose output parm is known by name, so it is read whatever its
+#: template says. HeightField Output's image path is "output" (read from the
+#: 22.0.508 OPlibTerrain.hda dialog script, type "image"), and the node presses
+#: an internal COP ROP, so start_render reported its PNGs "unverified" (4b #2).
+TYPE_OUTPUT_PARMS = {"heightfield_output": ("output",)}
+
+
+def tile_filenames(
+    filename: str,
+    tiles_x: int,
+    tiles_y: int,
+    naming: int,
+    stride: int = 10,
+    pad: int = 1,
+    flop: bool = False,
+) -> list[str]:
+    """The files HeightField Output writes with "Divide into tiled maps" on.
+
+    The same names as Houdini's ``fileutils`` make for each File Naming
+    menu entry (0 UDIM, 1 UV tile, 2 frames, 3 XY tile), inserted before the
+    extension, with x and y swapped when the output is flopped.
+    """
+    stem, dot, ext = filename.rpartition(".")
+    if not dot:
+        stem, ext = filename, ""
+    names = []
+    for y in range(max(1, tiles_y)):
+        for x in range(max(1, tiles_x)):
+            u, v = (y, x) if flop else (x, y)
+            if naming == 0:
+                insert = f".tile_{1001 + u + v * stride}"
+            elif naming == 1:
+                insert = f".u{str(u + 1).zfill(pad)}_v{str(v + 1).zfill(pad)}"
+            elif naming == 2:
+                insert = f".tile_{str(1 + u + v * max(1, tiles_x)).zfill(pad)}"
+            else:
+                insert = f"_x{u}_y{v}"
+            names.append(stem + insert + dot + ext)
+    return names
+
+
+def _int_parm(node: hou.Node, name: str, default: int = 0) -> int:
+    with contextlib.suppress(Exception):
+        return int(node.parm(name).eval())
+    return default
+
+
+def _heightfield_tiles(node: hou.Node, path: str) -> list[dict[str, Any]] | None:
+    """HeightField Output's tile files when it divides into tiled maps, else None."""
+    if not _int_parm(node, "tile_output"):
+        return None
+    names = tile_filenames(
+        path,
+        _int_parm(node, "actual_num_tilesx", 1),
+        _int_parm(node, "actual_num_tilesy", 1),
+        _int_parm(node, "file_naming"),
+        stride=_int_parm(node, "udim_stride", 10),
+        pad=_int_parm(node, "tile_padding", 1),
+        flop=bool(_int_parm(node, "flop")),
+    )
+    return [_file_entry("output[tile]", name) for name in names]
+
+
+def _type_name(node: hou.Node) -> str:
+    with contextlib.suppress(Exception):
+        return node.type().nameComponents()[2]
+    with contextlib.suppress(Exception):
+        return node.type().name().split("::")[0]
+    return ""
+
+
+def _executable_file_parms(node: hou.Node) -> list[dict[str, Any]]:
+    """The visible file parms of a node that writes on a button press (not a ROP).
+
+    The same fallback the Labs VAT ROP got, for SOP-level writers whose
+    output parm this module does not know by name: only the files on disk
+    are listed, or all of them when none is.
+    """
+    try:
+        if node.parm("execute") is None:
+            return []
+        parms = [
+            p
+            for p in node.parms()
+            if p.name() not in _SCRIPT_PARMS and not p.isHidden() and _is_file_parm(p)
+        ]
+    except Exception:
+        return []
+    entries = []
+    for parm in parms:
+        with contextlib.suppress(Exception):
+            path = parm.eval()
+            if path and not os.path.isdir(path):
+                entries.append(_file_entry(parm.name(), path))
+    existing = [e for e in entries if e.get("exists")]
+    return existing or entries
+
+
 def reported_outputs(node: hou.Node) -> list[dict[str, Any]]:
     """The node's output path(s) and whether anything is on disk there."""
     found = _known_outputs(node)
-    return found or _rop_file_parms(node)
+    return found or _rop_file_parms(node) or _executable_file_parms(node)
 
 
 def _known_outputs(node: hou.Node) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
+    named = TYPE_OUTPUT_PARMS.get(_type_name(node), ())
+    for name in named:
+        parm = node.parm(name)
+        if parm is None:
+            continue
+        with contextlib.suppress(Exception):
+            path = parm.eval()
+            if not path:
+                found.append({"parm": name, "path": None, "exists": False, "empty": True})
+                continue
+            tiles = _heightfield_tiles(node, path) if name == "output" else None
+            if tiles:
+                existing = [entry for entry in tiles if entry.get("exists")]
+                found.extend(existing or tiles)
+            else:
+                found.append(_file_entry(name, path))
+    if found:
+        return found
     for name in OUTPUT_PARMS:
         parm = node.parm(name)
         if parm is None:

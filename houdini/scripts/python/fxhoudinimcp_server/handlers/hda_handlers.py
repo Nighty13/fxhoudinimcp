@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+from datetime import datetime, timezone
 from difflib import get_close_matches
 
 # Third-party
@@ -532,6 +533,8 @@ def create_hda(
     type_name: str,
     label: str,
     version: str = "1.0",
+    promote_from: str | None = None,
+    inputs: list | None = None,
 ) -> dict:
     """Create a new HDA from an existing subnet node.
 
@@ -541,6 +544,11 @@ def create_hda(
         type_name: The operator type name for the HDA.
         label: Human-readable label for the HDA.
         version: Version string (default "1.0").
+        promote_from: A node inside the subnet (relative path, typically a
+            "CONTROLS" null) whose spare parameters become the asset's
+            interface, with their current values as defaults; the node's
+            parms are then channel-referenced to the asset's.
+        inputs: [{label, optional}] per input (see set_hda_interface).
     """
     require_inside_project_root(hda_file, "HDA file")
     # Expanded so the reply names the file written, not "$JOB/...".
@@ -552,6 +560,13 @@ def create_hda(
         raise ValueError(
             f"Node {node_path} is not a subnet. Only subnet nodes can be converted to HDAs."
         )
+    # Checked before the subnet becomes an asset: afterwards a refusal would
+    # leave a half-made asset behind.
+    if inputs is not None:
+        _normalise_inputs(inputs)
+    controls_inner = None
+    if promote_from:
+        controls_inner = _controls_inside(node, str(promote_from))
 
     # createDigitalAsset defaults to max_num_inputs=0, so a subnet that processes
     # its input geometry became an asset with no input at all.
@@ -591,6 +606,29 @@ def create_hda(
             connectors = _read_connectors(definition)
         except Exception as e:
             connector_error = readable_message(e)
+    # From here the asset exists: failures are reported, not raised.
+    warnings = []
+    if connector_error is not None:
+        warnings.append(
+            f"The asset was created, but its connectors could not be signed: {connector_error}"
+        )
+    promotion = None
+    if controls_inner is not None:
+        try:
+            promotion = _promote_controls(hda_node, controls_inner)
+        except Exception as e:
+            warnings.append(
+                f"The asset was created, but promote_from {promote_from!r} failed: "
+                f"{readable_message(e)}"
+            )
+    inputs_result = None
+    if inputs is not None:
+        try:
+            inputs_result = _apply_inputs(definition, inputs)
+        except Exception as e:
+            warnings.append(
+                f"The asset was created, but its inputs could not be set: {readable_message(e)}"
+            )
     result = {
         "success": True,
         "node_path": hda_node.path(),
@@ -604,10 +642,116 @@ def create_hda(
     if connectors is not None:
         # Signed from the subnet's inputtype#/outputtype# and labels.
         result["connectors"] = connectors
-    if connector_error is not None:
-        result["warning"] = (
-            f"The asset was created, but its connectors could not be signed: {connector_error}"
+    if promotion is not None:
+        result["promoted_from"] = promotion
+    if inputs_result is not None:
+        result["inputs"] = inputs_result
+    if warnings:
+        result["warning"] = " ".join(warnings)
+    return result
+
+
+#: Templates with no value to promote or link.
+_NO_VALUE_KINDS = frozenset({"Folder", "FolderSet", "Separator", "Label", "Button", "Data"})
+
+
+def _controls_inside(subnet, promote_from: str) -> str:
+    """*promote_from*'s path relative to *subnet*, checked to be inside it with spares."""
+    controls = subnet.node(promote_from)
+    if controls is None:
+        raise ValueError(
+            f"promote_from {promote_from!r} is not a node inside {subnet.path()} "
+            "(give a path relative to the subnet, e.g. 'CONTROLS'). Nothing was created."
         )
+    prefix = subnet.path().rstrip("/") + "/"
+    if not controls.path().startswith(prefix):
+        raise ValueError(
+            f"promote_from {promote_from!r} resolves to {controls.path()}, which is not "
+            f"inside {subnet.path()}. Nothing was created."
+        )
+    if not controls.spareParms():
+        raise ValueError(
+            f"promote_from {controls.path()} has no spare parameters to promote "
+            "(add them with create_spare_parameters). Nothing was created."
+        )
+    return controls.path()[len(prefix) :]
+
+
+def _promote_controls(hda_node, inner_path: str) -> dict:
+    """Copy a CONTROLS node's spare parms onto the asset interface and link them back.
+
+    Promoting by hand was ~4 calls plus python: the interface, the unlock,
+    one ch("../x") per parm, the save. Defaults are the CURRENT values: an
+    engine such as Unreal cooks the definition's defaults.
+    """
+    definition = hda_node.type().definition()
+    locked_before = bool(hda_node.isLockedHDA())
+    if locked_before:
+        hda_node.allowEditingOfContents()
+    controls = hda_node.node(inner_path)
+    if controls is None:
+        raise ValueError(f"{inner_path!r} is not inside {hda_node.path()} any more.")
+    group = definition.parmTemplateGroup()
+    existing = {t.name() for t in _flatten_templates(group.entries())}
+    promoted, skipped, sources, seen = [], [], [], set()
+    for parm in controls.spareParms():
+        parm_tuple = _parm_tuple_of(parm)
+        name = parm_tuple.name()
+        if name in seen:
+            continue
+        seen.add(name)
+        template = parm_tuple.parmTemplate()
+        kind = template.type().name()
+        if kind in _NO_VALUE_KINDS:
+            continue
+        if name in existing:
+            skipped.append({"name": name, "reason": "already on the asset's interface"})
+            continue
+        clone = template.clone()
+        try:
+            default = _set_default_from_parm(clone, parm_tuple, name)
+        except Exception as e:
+            skipped.append({"name": name, "reason": readable_message(e)})
+            continue
+        group.append(clone)
+        existing.add(name)
+        promoted.append({"name": name, "type": kind, "default": default})
+        sources.append((parm_tuple, kind))
+    if promoted:
+        definition.setParmTemplateGroup(group)
+
+    # ch() paths are relative to the node that owns the parm: one ".." per
+    # level between CONTROLS and the asset ("CONTROLS" -> "..", "a/CONTROLS" -> "../..").
+    up = "/".join([".."] * len([part for part in inner_path.split("/") if part]))
+    linked = []
+    for parm_tuple, kind in sources:
+        if kind == "Ramp":
+            target = hda_node.parm(parm_tuple.name())
+            ramp_parm = list(parm_tuple)[0]
+            # Parm.set(Parm) writes a relative channel reference, keys included.
+            ramp_parm.set(target)
+            linked.append(ramp_parm.name())
+            continue
+        function = "chs" if kind == "String" else "ch"
+        for parm in parm_tuple:
+            with contextlib.suppress(Exception):
+                parm.deleteAllKeyframes()
+            parm.setExpression(f'{function}("{up}/{parm.name()}")', hou.exprLanguage.Hscript)
+            linked.append(parm.name())
+    # The links live inside the asset's contents: save them into the definition.
+    if sources:
+        definition.updateFromNode(hda_node)
+    result = {
+        "node": controls.path(),
+        "parameters": promoted,
+        "linked": linked,
+        "reference": f'ch("{up}/<name>")',
+        "locked_before": locked_before,
+        "locked_after": bool(hda_node.isLockedHDA()),
+        "contents_saved": bool(sources),
+    }
+    if skipped:
+        result["skipped"] = skipped
     return result
 
 
@@ -741,6 +885,7 @@ _TEMPLATE_KEYS = frozenset(
         "tags",
         "look",
         "from_parm",
+        "default_from_value",
     }
 )
 
@@ -870,6 +1015,91 @@ def _ramp_default_tag(spec: dict, color: bool) -> tuple[str, int]:
     return " ".join(parts), len(keys)
 
 
+#: str(hou.rampBasis.X) tail -> the interp spelling of a ramp default tag.
+_RAMP_BASIS_INTERP = {
+    "constant": "constant",
+    "linear": "linear",
+    "catmullrom": "catmull-rom",
+    "monotonecubic": "monotonecubic",
+    "bezier": "bezier",
+    "bspline": "bspline",
+    "hermite": "hermite",
+}
+
+
+def _parm_tuple_of(parm):
+    """The hou.ParmTuple of a Parm (or the ParmTuple itself)."""
+    to_tuple = getattr(parm, "tuple", None)
+    return to_tuple() if callable(to_tuple) else parm
+
+
+def _string_value(parm) -> str:
+    """A string parm's raw text ($HIP kept), or its value when it has an expression."""
+    try:
+        return parm.unexpandedString()
+    except Exception:
+        return parm.evalAsString()
+
+
+def _current_value(parm_tuple, kind: str):
+    """A parm tuple's current value in the form its template's default takes.
+
+    Int/Float/String: a tuple, one value per component (evaluated, so an
+    expression or keyframe gives what it reads now; a string keeps its raw
+    text). Toggle: a bool. Menu: the item index.
+    """
+    parms = list(parm_tuple)
+    if kind == "Toggle":
+        return bool(parms[0].eval())
+    if kind == "Menu":
+        return int(parms[0].evalAsInt())
+    if kind == "String":
+        return tuple(_string_value(p) for p in parms)
+    if kind == "Int":
+        return tuple(int(p.eval()) for p in parms)
+    if kind == "Float":
+        return tuple(float(p.eval()) for p in parms)
+    raise ValueError(f"a {kind} parameter has no value to take a default from.")
+
+
+def _set_default_from_parm(template, source, name: str):
+    """Make *source*'s current value *template*'s default; returns what was written.
+
+    `from_parm` alone copies the source's TEMPLATE default, so values tuned on
+    a CONTROLS null (waterfall 0.6) came back as the stock 0.35 -- and Unreal
+    cooks the definition's defaults, not the instance's values.
+    """
+    parm_tuple = _parm_tuple_of(source)
+    kind = template.type().name()
+    if kind == "Ramp":
+        ramp = list(parm_tuple)[0].eval()
+        color = bool(ramp.isColor())
+        keys = []
+        for pos, value, basis in zip(ramp.keys(), ramp.values(), ramp.basis(), strict=False):
+            interp = str(basis).rsplit(".", 1)[-1].replace("-", "").lower()
+            keys.append(
+                {
+                    "pos": pos,
+                    "value": list(value) if color else value,
+                    "interp": _RAMP_BASIS_INTERP.get(interp, "linear"),
+                }
+            )
+        tag, count = _ramp_default_tag({"name": name, "default": keys}, color)
+        tags = dict(template.tags())
+        tags["rampcolordefault" if color else "rampfloatdefault"] = tag
+        template.setTags(tags)
+        template.setDefaultValue(count)
+        return {"keys": count}
+    try:
+        value = _current_value(parm_tuple, kind)
+    except ValueError as exc:
+        raise ValueError(f"{name!r}: {exc}") from None
+    template.setDefaultValue(value)
+    if isinstance(value, tuple) and len(value) == 1:
+        return value[0]
+    return list(value) if isinstance(value, tuple) else value
+
+
 def _cloned_template(spec: dict, name: str):
     """A copy of another node's parameter template, renamed (`from_parm`).
 
@@ -878,9 +1108,17 @@ def _cloned_template(spec: dict, name: str):
     """
     ignored = sorted(set(spec) & _NOT_WITH_FROM_PARM)
     if ignored:
+        hint = ""
+        if "default" in ignored:
+            hint = (
+                " For the source's current value as the default, pass "
+                "default_from_value=True; for another value, insert it with from_parm "
+                "first, then edit_hda_interface {'op': 'modify', 'default': ...}."
+            )
         raise ValueError(
             f"{name!r}: from_parm copies the template whole, so {ignored} would be "
-            "ignored. Drop them, or build the parameter without from_parm."
+            f"ignored. Drop them, or build the parameter without from_parm.{hint} "
+            "Nothing was written."
         )
     path = str(spec["from_parm"])
     parm = hou.parm(path) or hou.parmTuple(path)
@@ -889,6 +1127,8 @@ def _cloned_template(spec: dict, name: str):
             f"{name!r}: from_parm {path!r} is not a parameter (give /path/to/node/parm)."
         )
     template = parm.parmTemplate().clone()
+    if spec.get("default_from_value"):
+        _set_default_from_parm(template, parm, name)
     template.setName(name)
     # The source's conditionals and callback name parms of the source node,
     # not of this asset; the spec's own are applied afterwards.
@@ -949,6 +1189,11 @@ def _build_parm_template(spec: dict, seen: set):
     seen.add(name)
 
     _check_spec_keys(spec)
+    if spec.get("default_from_value") and not spec.get("from_parm"):
+        raise ValueError(
+            f"{name!r}: default_from_value reads the value of the from_parm source; "
+            "this spec has no from_parm. Give 'default' instead."
+        )
     label = spec.get("label") or name.replace("_", " ").title()
     kind = str(spec.get("type", "float")).lower()
     components = int(spec.get("components", 1))
@@ -1279,9 +1524,12 @@ def _describe_template(template) -> dict:
 
 def set_hda_interface(
     node_path: str,
-    parameters: list,
+    parameters: list | None = None,
     replace: bool = False,
     dry_run: bool = False,
+    default_from_value: bool = False,
+    inputs: list | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Author an HDA's Type Properties interface — the definition, not spares.
 
@@ -1306,7 +1554,9 @@ def set_hda_interface(
         from_parm ("/path/node/parm"): copy that parameter's template under
         `name` (label, help, conditionals still apply; the source's own conditionals and
         callback are dropped). A stock node's ramp
-        comes with its default keys.
+        comes with its default keys. default_from_value (True) takes the
+        source's current value as the default instead of its template's;
+        `default` with from_parm is refused.
         Any other key is refused with a did-you-mean (it used to be dropped).
     create_spare_parameters' spelling (parm_name, parm_type, default_value,
     min_val, max_val) is accepted too.
@@ -1317,19 +1567,184 @@ def set_hda_interface(
 
     Args:
         node_path: An instance of the HDA whose definition is edited.
-        parameters: Interface spec (see above).
+        parameters: Interface spec (see above). May be empty when only
+            `inputs` is given.
         replace: Start from an empty interface instead of appending to the
             existing one. Built-in parameters of the node type cannot be
             removed; Houdini puts them back (`reinstated_by_houdini`).
         dry_run: Validate and report the plan without writing.
+        default_from_value: Every from_parm spec takes its source's current
+            value as the default (a spec's own key wins).
+        inputs: [{label, optional}] per input, in order: labels, max inputs
+            = len, min inputs = the leading required ones.
+        verbose: Full template readback in `stored` instead of the compact
+            tree (name, type, label, default).
     """
     _get_node(node_path)  # a bad path is named before a bad spec
-    if not isinstance(parameters, (list, tuple)) or not parameters:
+    if inputs is not None:
+        _normalise_inputs(inputs)  # a bad inputs list is named before anything is written
+    if parameters is None:
+        parameters = []
+    if not isinstance(parameters, (list, tuple)) or (not parameters and inputs is None):
         raise ValueError("parameters must be a non-empty list of specs.")
-    ops = [{"op": "insert", "spec": spec} for spec in parameters]
-    result = _edit_interface(node_path, ops, dry_run=dry_run, clear_first=bool(replace))
-    result["replaced"] = bool(replace)
+    if default_from_value:
+        parameters = [_with_default_from_value(spec) for spec in parameters]
+    if parameters:
+        ops = [{"op": "insert", "spec": spec} for spec in parameters]
+        result = _edit_interface(
+            node_path, ops, dry_run=dry_run, clear_first=bool(replace), verbose=verbose
+        )
+        result["replaced"] = bool(replace)
+    else:
+        definition = _interface_definition(_get_node(node_path))
+        result = {
+            "success": True,
+            "node_path": node_path,
+            "type_name": definition.nodeTypeName(),
+            "hda_file": definition.libraryFilePath(),
+            "dry_run": bool(dry_run),
+            "ops": [],
+            "replaced": False,
+        }
+    if inputs is not None:
+        definition = _interface_definition(_get_node(node_path))
+        result["inputs"] = _apply_inputs(definition, inputs, dry_run=dry_run)
     return result
+
+
+def _with_default_from_value(spec):
+    """*spec* (and its children) with default_from_value on every from_parm entry."""
+    if not isinstance(spec, dict):
+        return spec
+    spec = dict(spec)
+    if spec.get("from_parm") and "default_from_value" not in spec:
+        spec["default_from_value"] = True
+    if isinstance(spec.get("children"), (list, tuple)):
+        spec["children"] = [_with_default_from_value(child) for child in spec["children"]]
+    return spec
+
+
+###### Input labels and counts (set_hda_interface / create_hda `inputs`)
+
+#: `inputlabel<TAB>N<TAB>"text"`: how a DialogScript names an asset's inputs
+#: (Type Properties > Input/Output). HOM has no setter for input labels on
+#: 20.5-22 (hou.Node.inputLabels() only reads), so the section is rewritten,
+#: the same way the Type Properties dialog stores them; the counts go through
+#: HDADefinition.setMinNumInputs / setMaxNumInputs.
+_INPUT_LABEL_LINE = re.compile(r"^\s*inputlabel\s+(\d+)\s+(.*?)\s*$")
+
+
+def _normalise_inputs(inputs) -> list[dict]:
+    """[{label, optional}] checked: known keys, required inputs first."""
+    if not isinstance(inputs, (list, tuple)):
+        raise ValueError(
+            'inputs must be a list such as [{"label": "Terrain"}, '
+            '{"label": "Curve", "optional": true}].'
+        )
+    wanted = []
+    for n, item in enumerate(inputs, 1):
+        if isinstance(item, str):
+            item = {"label": item}
+        if not isinstance(item, dict):
+            raise ValueError(f"inputs[{n - 1}] must be a dict {{label, optional}} or a string.")
+        unknown = sorted(set(item) - {"label", "optional"})
+        if unknown:
+            raise ValueError(f"inputs[{n - 1}]: unknown key(s) {unknown}; use label, optional.")
+        wanted.append(
+            {
+                "index": n,
+                "label": str(item.get("label") or f"Input {n}"),
+                "optional": bool(item.get("optional", False)),
+            }
+        )
+    seen_optional = None
+    for item in wanted:
+        if item["optional"]:
+            seen_optional = seen_optional or item
+        elif seen_optional is not None:
+            raise ValueError(
+                f"input {item['index']} ({item['label']!r}) is required but follows optional "
+                f"input {seen_optional['index']} ({seen_optional['label']!r}). Houdini's "
+                "minimum input count makes the FIRST N inputs required: list required inputs "
+                "first. Nothing was written."
+            )
+    return wanted
+
+
+def _read_input_labels(definition) -> list[dict]:
+    """The definition's inputlabel lines, as [{index, label}]."""
+    script = definition.sections()["DialogScript"].contents()
+    labels = {}
+    for line in script.splitlines():
+        match = _INPUT_LABEL_LINE.match(line)
+        if match:
+            labels[int(match.group(1))] = _unquoted(match.group(2))
+    return [{"index": n, "label": labels[n]} for n in sorted(labels)]
+
+
+def _write_input_labels(definition, labels: list[str]) -> None:
+    """Replace the DialogScript's inputlabel lines with *labels* (1-based)."""
+    script = definition.sections()["DialogScript"].contents()
+    kept, at = [], None
+    for line in script.splitlines():
+        if _INPUT_LABEL_LINE.match(line):
+            at = len(kept) if at is None else at
+            continue
+        kept.append(line)
+    if at is None:
+        at = next(
+            (i for i, line in enumerate(kept) if line.lstrip().startswith("outputlabel")),
+            None,
+        )
+    if at is None:
+        at = next((i + 1 for i, line in enumerate(kept) if line.startswith("    label\t")), 2)
+    kept[at:at] = [f"    inputlabel\t{n}\t{_quoted(label)}" for n, label in enumerate(labels, 1)]
+    tail = "\n" if script.endswith("\n") else ""
+    definition.addSection("DialogScript", "\n".join(kept) + tail)
+
+
+def _apply_inputs(definition, inputs, dry_run: bool = False) -> dict:
+    """Set an asset's input labels, max inputs (= len) and min inputs (required ones)."""
+    wanted = _normalise_inputs(inputs)
+    required = sum(1 for item in wanted if not item["optional"])
+    labels = [item["label"] for item in wanted]
+    if dry_run:
+        return {
+            "planned": {"labels": labels, "min_num_inputs": required, "max_num_inputs": len(wanted)}
+        }
+    if not _is_embedded(definition):
+        require_inside_project_root(definition.libraryFilePath(), "HDA library")
+    connectors = None
+    with contextlib.suppress(Exception):
+        connectors = _read_connectors(definition)
+    if connectors and connectors["inputs"]:
+        # A Copernicus asset names its inputs on `input` lines with a typed
+        # signature; relabel those (their count is the signature's).
+        existing = connectors["inputs"]
+        if len(existing) != len(wanted) or any("type" not in c for c in existing):
+            raise ValueError(
+                f"This Copernicus asset declares {len(existing)} typed input(s) in its "
+                f"signature; inputs lists {len(wanted)}. Relabel exactly those, or change "
+                "the subnet's inputs#/inputtype# parms and recreate the asset."
+            )
+        relabelled = [dict(c, label=label) for c, label in zip(existing, labels, strict=True)]
+        _write_connectors(definition, relabelled, connectors["outputs"])
+        definition.setMinNumInputs(required)
+        read = _read_connectors(definition)["inputs"]
+        return {
+            "min_num_inputs": definition.minNumInputs(),
+            "max_num_inputs": definition.maxNumInputs(),
+            "labels": [{"index": n, "label": c["label"]} for n, c in enumerate(read, 1)],
+        }
+    # Max before min: Houdini keeps min <= max.
+    definition.setMaxNumInputs(len(wanted))
+    definition.setMinNumInputs(required)
+    _write_input_labels(definition, labels)
+    return {
+        "min_num_inputs": definition.minNumInputs(),
+        "max_num_inputs": definition.maxNumInputs(),
+        "labels": _read_input_labels(definition),
+    }
 
 
 ###### hda.edit_hda_interface
@@ -1721,7 +2136,13 @@ def _apply_op(group, op: dict, index: int, existing: set) -> dict:
     )
 
 
-def edit_hda_interface(node_path: str, ops: list, dry_run: bool = False) -> dict:
+def edit_hda_interface(
+    node_path: str,
+    ops: list,
+    dry_run: bool = False,
+    default_from_value: bool = False,
+    verbose: bool = False,
+) -> dict:
     """Edit an HDA's existing Type Properties interface — atomically.
 
     `set_hda_interface` only appends. This takes a list of operations over
@@ -1735,23 +2156,81 @@ def edit_hda_interface(node_path: str, ops: list, dry_run: bool = False) -> dict
         node_path: An instance of the HDA whose definition is edited.
         ops: Operation dicts, applied in order.
         dry_run: Validate and report the plan without writing.
+        default_from_value: insert/replace specs with from_parm take the
+            source's current value as the default (a spec's own key wins).
+        verbose: Full template readback in `stored` instead of the compact tree.
     """
     _get_node(node_path)  # a bad path is named before bad ops
     if not isinstance(ops, (list, tuple)) or not ops:
         raise ValueError("ops must be a non-empty list of operation dicts.")
-    return _edit_interface(node_path, ops, dry_run=dry_run, clear_first=False)
+    if default_from_value:
+        ops = [
+            dict(op, spec=_with_default_from_value(op["spec"]))
+            if isinstance(op, dict) and isinstance(op.get("spec"), dict)
+            else op
+            for op in ops
+        ]
+    return _edit_interface(node_path, ops, dry_run=dry_run, clear_first=False, verbose=verbose)
 
 
-def _edit_interface(node_path: str, ops: list, dry_run: bool, clear_first: bool) -> dict:
-    """The one write path of set_hda_interface and edit_hda_interface."""
-    node = _get_node(node_path)
+def _interface_definition(node):
+    """The node's definition, or a refusal that names the spare-parm alternative."""
     try:
-        definition = _get_definition(node)
+        return _get_definition(node)
     except ValueError as exc:
         raise ValueError(
             f"{exc} There is no definition whose interface could be edited; for "
             f"parameters on this node only, use create_spare_parameter."
         ) from exc
+
+
+def _top_level_descriptions(infos: list[dict]) -> list[dict]:
+    """*infos* without entries already shown inside another entry's children.
+
+    An inserted folder's record names the folder AND every parm in it; each
+    was described on its own and again inside the folder, so a 21-parm
+    interface came back twice (~8k tokens).
+    """
+    nested: set = set()
+
+    def walk(children):
+        for child in children or ():
+            nested.add(child.get("name"))
+            walk(child.get("children"))
+
+    for info in infos:
+        walk(info.get("children"))
+    return [info for info in infos if info.get("name") not in nested]
+
+
+def _compact_description(info: dict) -> dict:
+    """name, type, label, default (+ children, hidden, default_expression)."""
+    out = {"name": info.get("name")}
+    for key in ("type", "label"):
+        if info.get(key) not in (None, ""):
+            out[key] = info[key]
+    default = info.get("default_value")
+    if default is not None and info.get("type") != "Folder":
+        if isinstance(default, (list, tuple)) and len(default) == 1:
+            default = default[0]
+        out["default"] = default
+    # Short and what a caller checks after writing them: kept in the compact form.
+    for key in ("default_expression", "default_expression_language", "help", "menu_items"):
+        if info.get(key):
+            out[key] = info[key]
+    if info.get("is_hidden"):
+        out["hidden"] = True
+    if "children" in info:
+        out["children"] = [_compact_description(child) for child in info["children"]]
+    return out
+
+
+def _edit_interface(
+    node_path: str, ops: list, dry_run: bool, clear_first: bool, verbose: bool = False
+) -> dict:
+    """The one write path of set_hda_interface and edit_hda_interface."""
+    node = _get_node(node_path)
+    definition = _interface_definition(node)
 
     group = definition.parmTemplateGroup()
     before_names = {t.name() for t in _flatten_templates(group.entries())}
@@ -1877,11 +2356,15 @@ def _edit_interface(node_path: str, ops: list, dry_run: bool, clear_first: bool)
                     else stored_group.isHidden(target)
                 )
         names = record.get("names") or ([target] if target else [])
-        record["stored"] = [
-            _describe_template(stored[renamed.get(n, n)])
-            for n in names
-            if renamed.get(n, n) in stored
-        ]
+        full = _top_level_descriptions(
+            [
+                _describe_template(stored[renamed.get(n, n)])
+                for n in names
+                if renamed.get(n, n) in stored
+            ]
+        )
+        record["stored"] = full if verbose else [_compact_description(info) for info in full]
+        record["_full"] = full
 
     # Parameters the instance should now carry: value templates only. A
     # folder of a tab set has no tuple of its own (the set's tuple takes the
@@ -1897,16 +2380,18 @@ def _edit_interface(node_path: str, ops: list, dry_run: bool, clear_first: bool)
     )
     result["instance_parms_present"] = [name for name in expected if name in on_node]
     result["instance_parms_missing"] = [name for name in expected if name not in on_node]
+
     # A default expression in the wrong language is stored without complaint
     # and evaluates to an empty value on the instance; only the node's error
     # says so. Each parm the write gave a default expression is evaluated.
+    def _expression_names(infos):
+        for info in infos:
+            if info.get("default_expression"):
+                yield info["name"]
+            yield from _expression_names(info.get("children") or ())
+
     with_expression = sorted(
-        {
-            info["name"]
-            for record in records
-            for info in record.get("stored", [])
-            if info.get("default_expression")
-        }
+        {name for record in records for name in _expression_names(record.pop("_full", []))}
     )
     result["instance_expression_errors"] = _instance_expression_errors(instance, with_expression)
     notes = []
@@ -1950,12 +2435,126 @@ def _instance_expression_errors(node, names) -> list[dict]:
 ###### hda.update_hda
 
 
-def update_hda(node_path: str) -> dict:
+#: Template kinds whose instance value can differ from the definition default.
+_VALUE_KINDS = frozenset({"Int", "Float", "String", "Toggle", "Menu"})
+
+
+def _same_value(a, b) -> bool:
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b, strict=True))
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return abs(float(a) - float(b)) <= 1e-6 * max(1.0, abs(float(b)))
+        except (TypeError, ValueError):
+            return False
+    return a == b
+
+
+def _template_default(template, kind: str):
+    value = template.defaultValue()
+    if kind == "Toggle":
+        return bool(value)
+    if kind == "Menu":
+        return int(value)
+    return tuple(value) if isinstance(value, (list, tuple)) else (value,)
+
+
+def _plain(value):
+    if isinstance(value, tuple):
+        return value[0] if len(value) == 1 else list(value)
+    return value
+
+
+def _instance_values_differ(node, definition) -> list[dict]:
+    """Definition parms whose value on *node* is not the definition's default.
+
+    Unreal (Houdini Engine) cooks the definition's defaults: values tuned on
+    the Houdini instance never reached it, and every tuning was redone with
+    edit_hda_interface modify default (notes 4c-2). Parms whose template has
+    a default expression are skipped: their value is computed.
+    """
+    differ = []
+    for template in _flatten_templates(definition.parmTemplateGroup().entries()):
+        kind = template.type().name()
+        name = template.name()
+        if kind not in _VALUE_KINDS or "#" in name:
+            continue
+        with contextlib.suppress(Exception):
+            if any(template.defaultExpression()):
+                continue
+        parm_tuple = node.parmTuple(name)
+        if parm_tuple is None:
+            continue
+        try:
+            current = _current_value(parm_tuple, kind)
+            default = _template_default(template, kind)
+        except Exception:
+            continue
+        if _same_value(current, default):
+            continue
+        entry = {"parm": name, "instance": _plain(current), "default": _plain(default)}
+        with contextlib.suppress(Exception):
+            if any(_has_expression(p) for p in parm_tuple):
+                entry["expression"] = True
+        differ.append(entry)
+    return differ
+
+
+def _has_expression(parm) -> bool:
+    try:
+        parm.expression()
+    except Exception:
+        return False
+    return True
+
+
+def _is_locked(node) -> bool | None:
+    try:
+        return bool(node.isLockedHDA())
+    except Exception:
+        return None
+
+
+def _mtime_fields(prefix: str, mtime: float | None) -> dict:
+    """An mtime as an ISO string and integer epoch milliseconds.
+
+    The client trims every float to 7 significant digits (server._trim), so
+    an epoch of 1795525375.12 reached the caller as 1795525000.0 -- the same
+    "mtime" on two saves minutes apart. A string and an int pass through.
+    """
+    if mtime is None:
+        return {f"{prefix}_iso": None, f"{prefix}_epoch_ms": None}
+    # UTC: local-time conversion fails on Windows for some timestamps.
+    return {
+        f"{prefix}_iso": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(
+            timespec="microseconds"
+        ),
+        f"{prefix}_epoch_ms": int(round(mtime * 1000)),
+    }
+
+
+def update_hda(
+    node_path: str,
+    unlock: bool = False,
+    lock: bool = False,
+    save: bool = True,
+    promote_current_values: bool = False,
+) -> dict:
     """Save the current node contents back to its HDA definition.
 
     Args:
         node_path: Path to the HDA node instance.
+        unlock: Allow editing of contents (node.allowEditingOfContents())
+            before saving, and leave the instance unlocked.
+        lock: After saving, lock the instance back to the definition
+            (node.matchCurrentDefinition()).
+        save: Write the contents to the definition (updateFromNode). False
+            with unlock=True is the bare "unlock" door.
+        promote_current_values: Write the instance values listed in
+            `instance_values_differ` into the definition as its new defaults.
     """
+    if unlock and lock:
+        raise ValueError("unlock and lock contradict each other; pass one.")
     node = _get_node(node_path)
     definition = _get_definition(node)
     library = definition.libraryFilePath()
@@ -1964,16 +2563,93 @@ def update_hda(node_path: str) -> dict:
     def _mtime() -> float | None:
         if embedded:
             return None
+        # os.path.getmtime is os.stat(path).st_mtime, read fresh each call.
         with contextlib.suppress(Exception):
             return os.path.getmtime(library)
         return None
 
+    locked_before = _is_locked(node)
+    if unlock and locked_before:
+        try:
+            node.allowEditingOfContents()
+        except Exception as e:
+            raise ValueError(
+                f"Could not allow editing of {node.path()}'s contents: {readable_message(e)}"
+            ) from e
+
+    differ = None
+    with contextlib.suppress(Exception):
+        differ = _instance_values_differ(node, definition)
+    promoted_defaults: list[str] = []
+    if promote_current_values and differ:
+        if not embedded:
+            require_inside_project_root(library, "HDA library")
+        group = definition.parmTemplateGroup()
+        for entry in differ:
+            template = group.find(entry["parm"])
+            parm_tuple = node.parmTuple(entry["parm"])
+            if template is None or parm_tuple is None:
+                continue
+            clone = template.clone()
+            _set_default_from_parm(clone, parm_tuple, entry["parm"])
+            group.replace(template, clone)
+            promoted_defaults.append(entry["parm"])
+        try:
+            definition.setParmTemplateGroup(group)
+        except Exception as e:
+            raise ValueError(
+                f"Houdini refused the new defaults: {readable_message(e)}. Nothing was saved."
+            ) from e
+
     before = _mtime()
-    try:
-        node.type().definition().updateFromNode(node)
-    except Exception as e:
-        raise ValueError(f"Failed to update HDA definition: {readable_message(e)}") from e
+    if save:
+        try:
+            node.type().definition().updateFromNode(node)
+        except Exception as e:
+            raise ValueError(f"Failed to update HDA definition: {readable_message(e)}") from e
     after = _mtime()
+
+    if lock:
+        try:
+            node.matchCurrentDefinition()
+        except Exception as e:
+            raise ValueError(
+                f"Saved, but could not lock {node.path()} to its definition: {readable_message(e)}"
+            ) from e
+    lock_fields = {"locked_before": locked_before, "locked_after": _is_locked(node)}
+    differ_fields: dict = {}
+    if differ is not None:
+        remaining = [e for e in differ if e["parm"] not in promoted_defaults]
+        differ_fields["instance_values_differ"] = remaining
+        if promoted_defaults:
+            differ_fields["promoted_defaults"] = promoted_defaults
+        if remaining:
+            differ_fields["warning"] = (
+                f"{len(remaining)} parameter(s) differ on this instance from the definition's "
+                "defaults (instance_values_differ). Houdini Engine (Unreal) cooks the "
+                "DEFAULTS; pass promote_current_values=True to make these values the defaults."
+            )
+
+    if not save:
+        message = (
+            "Contents unlocked for editing; nothing was saved."
+            if unlock
+            else "Nothing was saved (save=False)."
+        )
+        result = {
+            "success": True,
+            "node_path": node.path(),
+            "type_name": definition.nodeTypeName(),
+            "library_file": library,
+            "saved_to_disk": None,
+            "message": message,
+            **lock_fields,
+            **differ_fields,
+        }
+        if promoted_defaults:
+            result["library_file_mtime"] = after
+            result.update(_mtime_fields("library_file_mtime", after))
+        return result
 
     # updateFromNode() writes the library file itself (measured on 22.0.429:
     # the mtime moves and a fresh instance carries the new contents). Saying
@@ -1992,14 +2668,22 @@ def update_hda(node_path: str) -> dict:
         )
     else:
         message = "HDA definition updated from node contents and written to the library file."
+    if locked_before and not unlock:
+        message += (
+            " The instance was locked, so its contents already were the definition's; "
+            "pass unlock=True to edit them."
+        )
     return {
         "success": True,
         "node_path": node.path(),
         "type_name": definition.nodeTypeName(),
         "library_file": library,
         "library_file_mtime": after,
+        **_mtime_fields("library_file_mtime", after),
         "saved_to_disk": saved,
         "message": message,
+        **lock_fields,
+        **differ_fields,
         "note": (
             "To check the result with a fresh instance of the type: its children load "
             "lazily, so cook it (or look one up with node.node('name')) before reading "

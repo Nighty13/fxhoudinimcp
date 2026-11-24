@@ -56,6 +56,20 @@ class TestBadValuesAreRejected:
             ("expression", "syntax", "parse", "invalid", "error", "unmatched", "failed"),
         )
 
+    def test_a_sheet_asks_for_one_mode(self, call):
+        answer = call(
+            "rendering.render_sheet",
+            assert_failure=True,
+            output_path="$HIP/sheet.png",
+            orbit=4,
+            views=["front"],
+        )
+        assert_useful(
+            "rendering.render_sheet",
+            message_of(answer),
+            ("orbit", "views", "one", "mode", "viewport", "both"),
+        )
+
     def test_python_that_raises_is_reported_not_swallowed(self, call):
         answer = call(
             "code.execute_python",

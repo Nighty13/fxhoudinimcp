@@ -108,6 +108,7 @@ def _name_connectors(wire: dict, source, target, named_inputs: bool) -> None:
 def _get_network_overview(
     path: str = "/obj",
     depth: int = 2,
+    detail: str = "full",
     **_: Any,
 ) -> dict:
     """Return a compact network overview of nodes and connections.
@@ -115,10 +116,39 @@ def _get_network_overview(
     Args:
         path: Root network path to inspect.
         depth: How many levels deep to recurse into children.
+        detail: "compact" answers the graph as text only (`graph`: one line
+            per node, inputs in connector order, flags when set) plus the
+            erroring nodes. "full" adds per-node records with positions and
+            every wire as an object (~1k tokens per 16 nodes).
     """
+    compact = str(detail).lower() == "compact"
 
     def _build_overview(network: hou.Node, remaining_depth: int) -> dict:
         children = network.children()
+        if compact:
+            result: dict[str, Any] = {
+                "path": network.path(),
+                "node_count": len(children),
+                "graph": _build_ascii_flow(children),
+            }
+            for child in children:
+                flags = _node_flags(child)
+                if flags.get("display"):
+                    result["display_node"] = child.name()
+                if flags.get("render"):
+                    result["render_node"] = child.name()
+            erroring = [c.name() for c in children if _has_errors(c)]
+            if erroring:
+                result["error_nodes"] = erroring
+            if remaining_depth > 1:
+                nested = {
+                    c.name(): _build_overview(c, remaining_depth - 1)
+                    for c in children
+                    if c.children()
+                }
+                if nested:
+                    result["child_networks"] = nested
+            return result
 
         nodes_info = []
         connections = []
@@ -618,28 +648,143 @@ def _get_scene_summary(**_: Any) -> dict:
 ###### context.compare_snapshots
 
 
+# Raw parameter state per snapshot, for action="restore": {name: {node path:
+# {parm name: state}}}. Only taken for a scoped snapshot (node_path).
+_raw_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def _raw_parm_state(parm: Any) -> dict[str, Any]:
+    """What restoring *parm* needs: its expression, or its literal value."""
+    keyframes = []
+    with contextlib.suppress(Exception):
+        keyframes = list(parm.keyframes())
+    if len(keyframes) > 1:
+        return {"animated": len(keyframes)}
+    with contextlib.suppress(Exception):
+        expression = parm.expression()
+        language = parm.expressionLanguage()
+        return {"expr": expression, "language": language}
+    with contextlib.suppress(Exception):
+        if parm.parmTemplate().type() == hou.parmTemplateType.String:
+            return {"value": parm.unexpandedString()}
+    return {"value": parm.eval()}
+
+
+def _scope_nodes(node_path: str) -> list:
+    node = _get_node(node_path)
+    found = [node]
+    with contextlib.suppress(Exception):
+        found += [n for n in node.allSubChildren() if not n.isInsideLockedHDA()]
+    return found
+
+
+def _is_count_parm(parm: Any) -> bool:
+    with contextlib.suppress(Exception):
+        return "Multiparm" in parm.parmTemplate().folderType().name()
+    return False
+
+
+def _capture_raw(node_path: str) -> dict[str, dict[str, Any]]:
+    state: dict[str, dict[str, Any]] = {}
+    for node in _scope_nodes(node_path):
+        parms: dict[str, Any] = {}
+        for parm in node.parms():
+            with contextlib.suppress(Exception):
+                parms[parm.name()] = _raw_parm_state(parm)
+        state[node.path()] = parms
+    return state
+
+
+def _restore_raw(raw: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Write every captured parm back; multiparm counts first."""
+    restored = 0
+    skipped: list[str] = []
+    missing_nodes: list[str] = []
+    for path, parms in raw.items():
+        node = hou.node(path)
+        if node is None:
+            missing_nodes.append(path)
+            continue
+        names = sorted(parms, key=lambda n: (not _is_count_parm(node.parm(n)), n))
+        for name in names:
+            state = parms[name]
+            parm = node.parm(name)
+            if parm is None:
+                continue
+            label = f"{path}/{name}"
+            if "animated" in state:
+                skipped.append(f"{label} (animated)")
+                continue
+            try:
+                if parm.isLocked():
+                    skipped.append(f"{label} (locked)")
+                    continue
+                current = _raw_parm_state(parm)
+                if current == state:
+                    continue
+                if "expr" in state:
+                    parm.setExpression(state["expr"], state["language"], replace_expression=True)
+                else:
+                    if "expr" in current:
+                        parm.deleteAllKeyframes()
+                    parm.set(state["value"])
+                restored += 1
+            except Exception as exc:  # noqa: BLE001 - report and keep restoring the rest
+                skipped.append(f"{label} ({exc})")
+    result: dict[str, Any] = {"parms_restored": restored}
+    if skipped:
+        result["not_restored"] = skipped[:100]
+    if missing_nodes:
+        result["missing_nodes"] = missing_nodes
+    return result
+
+
 def _compare_snapshots(
     action: str = "take",
     snapshot_name: str = "default",
+    node_path: str | None = None,
     **_: Any,
 ) -> dict:
-    """Take or compare scene snapshots for structural diffing.
+    """Take, compare or restore scene snapshots.
 
     Args:
-        action: "take" to store current state, "compare" to diff against stored.
+        action: "take" to store current state, "compare" to diff against
+            stored, "restore" to write a scoped snapshot's parameters back.
         snapshot_name: Name of the snapshot to take or compare against.
+        node_path: Scope the snapshot to this node and its children. A scoped
+            snapshot also records each parameter's raw state (expression or
+            literal), which "restore" writes back. Animated parms are
+            reported, not restored.
     """
     global _snapshots
 
     _SNAPSHOT_NODE_LIMIT = 1000
 
+    if action == "restore":
+        raw = _raw_snapshots.get(snapshot_name)
+        if raw is None:
+            raise ValueError(
+                f"No restorable snapshot named '{snapshot_name}'. Take one with "
+                f"action='take', node_path=<node> first (restorable: {sorted(_raw_snapshots)})."
+            )
+        return {
+            "success": True,
+            "action": "restore",
+            "snapshot_name": snapshot_name,
+            **_restore_raw(raw),
+        }
+
     def _capture_state() -> dict[str, dict]:
         """Capture current scene state as a lightweight snapshot."""
         state: dict[str, dict] = {}
-        root = hou.node("/")
-        if root is None:
-            return state
-        for node in root.allSubChildren():
+        if node_path:
+            nodes = _scope_nodes(node_path)
+        else:
+            root = hou.node("/")
+            if root is None:
+                return state
+            nodes = root.allSubChildren()
+        for node in nodes:
             parms = _non_default_parms(node)
             state[node.path()] = {
                 "type": node.type().name(),
@@ -652,12 +797,18 @@ def _compare_snapshots(
     if action == "take":
         snapshot = _capture_state()
         _snapshots[snapshot_name] = snapshot
-        return {
+        reply: dict[str, Any] = {
             "success": True,
             "action": "take",
             "snapshot_name": snapshot_name,
             "node_count": len(snapshot),
         }
+        if node_path:
+            _raw_snapshots[snapshot_name] = _capture_raw(node_path)
+            reply["restorable"] = True
+        else:
+            _raw_snapshots.pop(snapshot_name, None)
+        return reply
 
     elif action == "compare":
         stored = _snapshots.get(snapshot_name)
@@ -715,15 +866,31 @@ def _compare_snapshots(
         }
 
     else:
-        raise ValueError(f"Unknown action '{action}'. Must be 'take' or 'compare'.")
+        raise ValueError(f"Unknown action '{action}'. Must be 'take', 'compare' or 'restore'.")
 
 
 ###### context.get_node_errors_detailed
 
 
+def _dedupe_messages(messages: list) -> list:
+    """Each distinct message once, with `(xN)` when it repeated on the node."""
+    counts: dict[str, int] = {}
+    for message in messages:
+        counts[str(message)] = counts.get(str(message), 0) + 1
+    return [m if n == 1 else f"{m} (x{n})" for m, n in counts.items()]
+
+
+def _inside_locked_asset(node: Any) -> bool:
+    with contextlib.suppress(Exception):
+        return bool(node.isInsideLockedHDA())
+    return False
+
+
 def _get_node_errors_detailed(
     node_path: str | None = None,
     root_path: str = "/",
+    include_locked_assets: bool = False,
+    include_warnings: bool = True,
     **_: Any,
 ) -> dict:
     """Deep error analysis for a specific node or all descendants of a root.
@@ -732,21 +899,32 @@ def _get_node_errors_detailed(
     and parameters that might be causing it (e.g. file path params
     pointing to missing files).
 
+    A scan skips the nodes inside locked HDAs (stock heightfield nodes'
+    unused for-each blocks drowned the real errors: 25 hits) unless
+    include_locked_assets=True; the skipped count is reported. A message a
+    node repeats is listed once with its count, and a node whose only
+    errors come from an erroring input is marked `blocked_by` that input
+    instead of repeating its message (`root_errors` lists the causes).
+
     Args:
         node_path: If given, analyze errors on this specific node.
         root_path: If node_path is None, scan all descendants of this root.
+        include_locked_assets: Also scan inside locked HDAs.
+        include_warnings: Report warnings too (default True).
     """
     import os as _os
 
     results: list[dict] = []
+    scanned_nodes: list = []
 
     def _analyze_node(node: hou.Node) -> None:
         errors = []
         warnings = []
         with contextlib.suppress(Exception):
-            errors = list(node.errors())
-        with contextlib.suppress(Exception):
-            warnings = list(node.warnings())
+            errors = _dedupe_messages(list(node.errors()))
+        if include_warnings:
+            with contextlib.suppress(Exception):
+                warnings = _dedupe_messages(list(node.warnings()))
 
         if not errors and not warnings:
             return
@@ -781,15 +959,20 @@ def _get_node_errors_detailed(
             except Exception:
                 pass
 
-        entry = {
+        entry: dict[str, Any] = {
             "node_path": node.path(),
             "node_type": node.type().name(),
-            "errors": errors,
-            "warnings": warnings,
-            "suspect_parameters": suspect_parms,
         }
+        if errors:
+            entry["errors"] = errors
+        if warnings:
+            entry["warnings"] = warnings
+        if suspect_parms:
+            entry["suspect_parameters"] = suspect_parms
         results.append(entry)
+        scanned_nodes.append(node)
 
+    skipped_locked = 0
     if node_path is not None:
         node = _get_node(node_path)
         _analyze_node(node)
@@ -797,13 +980,36 @@ def _get_node_errors_detailed(
         root = _get_node(root_path)
         _analyze_node(root)
         for child in root.allSubChildren():
+            if not include_locked_assets and _inside_locked_asset(child):
+                skipped_locked += 1
+                continue
             _analyze_node(child)
 
-    return {
+    result: dict[str, Any] = {
         "scanned_path": node_path or root_path,
-        "error_node_count": len(results),
+        "error_node_count": sum(1 for r in results if r.get("errors")),
         "details": results,
     }
+    # Inherited errors collapse to their root, as in verify_network.
+    with contextlib.suppress(Exception):
+        from fxhoudinimcp_server.handlers.graph_handlers import _collapse_inherited_errors
+
+        reports = [
+            {"path": r["node_path"], "errors": r["errors"]} for r in results if r.get("errors")
+        ]
+        if len(reports) > 1:
+            roots = _collapse_inherited_errors(scanned_nodes, reports)
+            by_path = {r["path"]: r for r in reports}
+            for entry in results:
+                report = by_path.get(entry["node_path"])
+                if report and report.get("blocked_by"):
+                    entry["blocked_by"] = report["blocked_by"]
+                    if "errors" not in report:
+                        entry.pop("errors", None)
+            result["root_errors"] = roots
+    if skipped_locked:
+        result["skipped_inside_locked_assets"] = skipped_locked
+    return result
 
 
 ###### Registration

@@ -26,6 +26,10 @@ async def get_parameter(ctx: Context, node_path: str, parm_name: str) -> dict:
     A ramp reads as {"type": "Ramp", "basis", "keys", "values", "is_color"},
     which set_parameters and build_network take back as it is.
 
+    A menu parameter (int or string) also answers `menu_items` (tokens),
+    `menu_labels` and `menu_token` (the one selected), generated menus
+    included, so it can be set by token without get_parameter_schema.
+
     Args:
         node_path: Node path.
         parm_name: Parameter name.
@@ -45,9 +49,10 @@ async def set_parameter(
     ctx: Context,
     node_path: str,
     parm_name: str,
-    value: Value,
+    value: Value | None = None,
     override_expression: bool = False,
     run_callbacks: bool = False,
+    from_file: str | None = None,
 ) -> dict:
     """Set a parameter value.
 
@@ -77,27 +82,35 @@ async def set_parameter(
     sets the lock. Houdini runs such callbacks only from the UI: set that menu
     with run_callbacks=True first, then the locked parameter.
 
+    A long String parameter (a Python SOP's code, a long snippet) is best
+    kept in a file: from_file="$HIP/scripts/gen.py" loads it ($HIP/$JOB
+    expanded, in Houdini) and the reply gives `chars`, `lines` and
+    `stored_matches_file`, never the text.
+
     Args:
         node_path: Node path.
         parm_name: Parameter name.
-        value: New value (int, float, string, bool, or list).
+        value: New value (int, float, string, bool, or list). Omit with from_file.
         override_expression: Remove an expression standing in the way,
             instead of reporting that the write did not take.
         run_callbacks: Run the parameter's callback script after the write,
             as editing it in the UI does (`callback_run` in the reply, and
             `callback_error` when the callback raised).
+        from_file: Path of a text file whose content becomes the value of
+            this String parameter, instead of value.
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute(
-        "parameters.set_parameter",
-        {
-            "node_path": node_path,
-            "parm_name": parm_name,
-            "value": value,
-            "override_expression": override_expression,
-            "run_callbacks": run_callbacks,
-        },
-    )
+    payload: dict[str, Any] = {
+        "node_path": node_path,
+        "parm_name": parm_name,
+        "override_expression": override_expression,
+        "run_callbacks": run_callbacks,
+    }
+    if from_file is not None:
+        payload["from_file"] = from_file
+    if value is not None or from_file is None:
+        payload["value"] = value
+    return await bridge.execute("parameters.set_parameter", payload)
 
 
 ###### parameters.set_parameters
@@ -144,6 +157,9 @@ async def set_parameters(
             float ramp takes numbers), the shape get_parameter reads it in.
             A ramp's `new_value` is what it holds once the whole call is
             through, so a key added by count and then set reads as set.
+            {"from_file": "$HIP/scripts/gen.py"} loads a String parameter
+            from a file (as set_parameter's from_file): its entry gives
+            `chars` and `lines`, not the text.
         override_expression: Remove expressions standing in the way.
         run_callbacks: Run each parameter's callback script after its write,
             as the UI does.
@@ -169,17 +185,25 @@ async def get_parameter_schema(
     node_path: str,
     parm_name: str | None = None,
     filter: str | None = None,
+    parm_names: list[str] | None = None,
+    patterns: list[str] | None = None,
 ) -> dict:
     """Get the template schema for parameter(s) on a node.
 
     Most nodes have dozens of parameters; many have 100+. Always use
-    `parm_name` or `filter` unless you genuinely need the full list.
+    `parm_names`, `parm_name` or `filter` unless you genuinely need the full
+    list. For just a menu's tokens, get_parameter is enough.
 
     Args:
         node_path: Node path.
         parm_name: Exact parameter name for a single-parameter lookup.
-        filter: Substring to match against parameter name or label
-                (case-insensitive). Use instead of dumping all params.
+        filter: Matched against parameter name or label, case-insensitive,
+            as get_parameters' patterns: a glob when it holds * ? or [
+            ("qa_*"), a substring otherwise, "a|b" for alternatives.
+        parm_names: Exact names for several parameters at once (unknown
+            ones come back in `not_found`).
+        patterns: A list of filters, the name get_parameters uses; combined
+            with `filter` if both are given.
     """
     bridge = _get_bridge(ctx)
     payload: dict[str, Any] = {"node_path": node_path}
@@ -187,6 +211,10 @@ async def get_parameter_schema(
         payload["parm_name"] = parm_name
     if filter is not None:
         payload["filter"] = filter
+    if parm_names is not None:
+        payload["parm_names"] = parm_names
+    if patterns is not None:
+        payload["patterns"] = patterns
     return await bridge.execute("parameters.get_parameter_schema", payload)
 
 
@@ -377,7 +405,10 @@ async def link_parameters(
 
     Two ramps (or two multiparms) are linked entry by entry as well, now and
     whenever the source gains or loses keys: the opmultiparm links Promote
-    Parameter makes. The reply lists `multiparm_links` and `follows_source`.
+    Parameter makes, so the destination ramp follows the source's keys,
+    positions, values and interpolation. The reply lists `multiparm_links`
+    and `follows_source`. A ramp linked to a plain parameter links only the
+    key count, and the reply's `warning` says so.
     Inside an asset, update_hda afterwards to keep the link in its contents.
 
     Args:
@@ -548,7 +579,7 @@ async def get_parameters(
     value_contains: str | None = None,
     non_default_only: bool = False,
 ) -> dict:
-    """Read many parameter values at once, matched by name or label substring.
+    """Read many parameter values at once, matched by name or label.
 
     The batch counterpart of set_parameters. Several unrelated groups of
     settings ("flame", "wind", "buoy") come back in one call instead of one call
@@ -563,9 +594,12 @@ async def get_parameters(
 
     Args:
         node_path: Node to read.
-        patterns: Substrings matched against parameter name and label. Omit for
-            everything, up to the cap. Required with `inside`, unless
-            non_default_only or value_contains.
+        patterns: Matched against parameter name and label, case-insensitive:
+            a glob when a pattern holds * ? or [ ("qa_*", "*scale"), a
+            substring otherwise ("flame"); "a|b" is two alternatives. The same
+            rule as get_parameter_schema's filter and get_node_card's
+            parm_filter. Omit for everything, up to the cap. Required with
+            `inside`, unless non_default_only or value_contains.
         include_defaults: Also report whether each value is still the default,
             and, where it differs, the default (`default`, `default_expression`).
         inside: Network to read instead of a single node.
@@ -604,3 +638,49 @@ async def get_parameters(
         if include_locked_assets:
             params["include_locked_assets"] = True
     return await bridge.execute("parameters.get_parameters", params)
+
+
+###### parameters.sweep_parameter
+
+
+@mcp.tool()
+async def sweep_parameter(
+    ctx: Context,
+    node_path: str,
+    parm_name: str,
+    values: list[Value],
+    measure: dict[str, Any] | list[dict[str, Any]] | None = None,
+) -> dict:
+    """Try several values of one parameter and measure each, then put it back.
+
+    For each value: set the parameter, cook the measured node, record one row.
+    The original value, expression or keyframes are restored afterwards
+    (`restored`, `original`), even on failure, and no undo entry is left.
+    Use it for design decisions ("threshold 0.2 / 0.5 / 0.8 -> how many
+    points survive?") instead of a set / verify / set loop. Menus take their
+    token ("centroid"), toggles 0/1, tuples a list per value.
+
+    Each row: `value`, `cook_ms`, `points`, `prims`, `errors` (if any) and
+    what `measure` asked for. With several measure dicts the per-node
+    results are in `measures`, in order.
+
+    Args:
+        node_path: Node holding the parameter.
+        parm_name: Parameter (or tuple name, e.g. "t") to sweep.
+        values: The values to try, in order (at most 64).
+        measure: What to read after each cook: {"node": path (default
+            node_path), "attribs": ["P", "dist"], "attrib_class": "point" |
+            "prim" | "detail" | "vertex", "percentiles": [5, 50, 95],
+            "detail_attribs": ["area"], "parms": ["volume", "/obj/x/n/parm"],
+            "expressions": ['npoints(".")']}, or a list of such dicts.
+            Stats are min/max/mean (+ percentiles) per attribute.
+    """
+    bridge = _get_bridge(ctx)
+    payload: dict[str, Any] = {
+        "node_path": node_path,
+        "parm_name": parm_name,
+        "values": values,
+    }
+    if measure is not None:
+        payload["measure"] = measure
+    return await bridge.execute("parameters.sweep_parameter", payload)

@@ -508,7 +508,7 @@ class TestTheCardListsParmsAddedOnCreate:
         assert entry["name"] == self.POINT_STYLE
         assert entry["label"] == "Render Points As"
         assert entry["added_on_create"] is True
-        assert card["parm_count"] == 1
+        assert card["parms_listed"] == 1  # parm_count is the type's total
         assert card["parms_added_on_create"] == 1
         # The connector probe skips creation scripts; this one runs them.
         scratch.createNode.assert_any_call("rendergeometrysettings")

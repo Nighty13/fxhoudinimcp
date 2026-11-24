@@ -31,6 +31,10 @@ async def render_viewport(
     resolution: list[int] | None = None,
     camera: str | None = None,
     settle_seconds: float = 0,
+    node: str | None = None,
+    visualize: bool = False,
+    instances: str | None = None,
+    max_size: int | None = None,
 ) -> dict:
     """Capture the current 3D viewport to an image file.
 
@@ -42,15 +46,33 @@ async def render_viewport(
         settle_seconds: Wait this long before capturing, without blocking
             Houdini, so a Karma viewport can converge after a change. Use
             this instead of a shell sleep between calls. Capped at 120.
+        node: Render only this SOP or object (a temporary object merge; no
+            display flag moves), framed on it.
+        visualize: For a heightfield: draw its layers through a temporary
+            heightfield_visualize instead of the grey surface. Uses node, or
+            the viewer's display SOP.
+        instances: Points to draw with it, e.g. scatter/instance points.
+        max_size: Cap on the longer side in pixels; scales down, keeps shape.
+
+    With node/visualize/instances everything is put back afterwards
+    (`restored`) and the scratch nodes are removed; `drawn` says what the
+    image holds.
     """
     bridge = _get_bridge(ctx)
     if settle_seconds > 0:
         await asyncio.sleep(min(settle_seconds, 120))
     params: dict[str, Any] = {"output_path": capture_path(output_path, "viewport")}
-    if resolution is not None:
-        params["resolution"] = resolution
-    if camera is not None:
-        params["camera"] = camera
+    for key, value in (
+        ("resolution", resolution),
+        ("camera", camera),
+        ("node", node),
+        ("instances", instances),
+        ("max_size", max_size),
+    ):
+        if value is not None:
+            params[key] = value
+    if visualize:
+        params["visualize"] = True
     return await bridge.execute("rendering.render_viewport", params)
 
 
@@ -259,6 +281,10 @@ async def get_render_progress(ctx: Context, node_path: str) -> dict:
     return await bridge.execute("rendering.get_render_progress", {"node_path": node_path})
 
 
+# A 64-tile sheet through the viewport: a flipbook per tile on Houdini's main thread.
+_SHEET_TIMEOUT = 600.0
+
+
 def _hython_for(version: str | None):
     """The installed hython of the running Houdini's build, else the default one."""
     for hython in find_all_hython():
@@ -270,36 +296,91 @@ def _hython_for(version: str | None):
 @mcp.tool()
 async def render_sheet(
     ctx: Context,
-    start: int,
-    end: int,
+    start: int | None = None,
+    end: int | None = None,
     step: int = 1,
-    camera: str | None = None,
+    camera: str | dict[str, Any] | None = None,
     resolution: list[int] | None = None,
     columns: int | None = None,
     output_path: str | None = None,
+    views: list[str | list[float]] | None = None,
+    orbit: int | None = None,
+    elevation: float | None = None,
+    by_attribute: str | None = None,
+    node: str | None = None,
+    frame: float | None = None,
+    hython: bool = False,
 ) -> dict:
-    """Render frames start..end with the OpenGL ROP and tile them into one image.
+    """Tile captures into one labelled contact sheet: frames, views or pieces.
 
-    One image shows motion a single frame cannot: a sim's spread, a camera
-    move. Needs no viewport, so it works in a headless session too. A snapshot
-    of the scene as it is now (unsaved edits included, the session untouched)
-    renders in a separate hython, since a second OpenGL render in one hython
-    crashes on Houdini 22; that hython takes a license seat while it runs.
-    Frames are labelled. Objects (/obj) only, not a LOP stage.
+    One image shows what a single frame cannot: a sim's spread (start..end),
+    a model from several sides (views / orbit, at one frame), or every
+    variant of a procedural asset (by_attribute: one tile per value, each
+    piece cut out with a temporary blast and framed on its own).
+
+    Rendered through the live viewport inside Houdini: no hython, no extra
+    license seat. Everything moved (frame, viewer, view) is put back and the
+    scratch nodes removed (`restored`). hython=True renders a frame range with
+    the OpenGL ROP in a separate hython on a snapshot instead: it needs no
+    viewport (headless sessions) but takes a license seat while it runs.
 
     Args:
-        start: First frame.
-        end: Last frame.
-        step: Frame step; at most 64 frames in all.
-        camera: Camera object path. Default: the scene's only camera.
+        start: First frame (frame sheet).
+        end: Last frame (frame sheet).
+        step: Frame step; at most 64 tiles in all.
+        camera: Camera object path (frame sheet); or a view dict like
+            capture_screenshot's. With views/orbit/by_attribute only look_at,
+            distance and clearance apply on top of each tile's angle.
         resolution: [width, height] of each tile. Default [320, 240].
         columns: Tiles per row. Default: about square.
         output_path: Sheet image path. Default: a new PNG in the temp dir.
+        views: Direction names ('front', 'right', 'top', 'persp', ...) or
+            [rx, ry] degrees, one perspective tile each, framing the subject.
+        orbit: N views around the subject, looking down `elevation` degrees.
+        elevation: Orbit tilt in degrees below the horizon. Default 25.
+        by_attribute: Integer or string prim/point attribute on node: one
+            tile per unique value.
+        node: Draw only this SOP or object (required with by_attribute); no
+            display flag moves.
+        frame: Frame for views/orbit/by_attribute. Default: the current one.
+        hython: Use the separate-hython OpenGL ROP path (frames only).
     """
-    count = len(range(start, end + 1, max(1, step)))
-    if step < 1 or count < 1 or count > 64:
-        raise ValueError(f"start..end by step gives {count} frames; give 1 to 64 with step >= 1.")
+    if start is not None or end is not None or hython:
+        if start is None or end is None:
+            raise ValueError("A frame sheet needs both start and end.")
+        count = len(range(start, end + 1, max(1, step)))
+        if step < 1 or count < 1 or count > 64:
+            raise ValueError(
+                f"start..end by step gives {count} frames; give 1 to 64 with step >= 1."
+            )
     bridge = _get_bridge(ctx)
+    if not hython:
+        params: dict[str, Any] = {"output_path": capture_path(output_path, "sheet")}
+        for key, value in (
+            ("start", start),
+            ("end", end),
+            ("views", views),
+            ("orbit", orbit),
+            ("elevation", elevation),
+            ("by_attribute", by_attribute),
+            ("node", node),
+            ("camera", camera),
+            ("resolution", resolution),
+            ("columns", columns),
+            ("frame", frame),
+        ):
+            if value is not None:
+                params[key] = value
+        if start is not None:
+            params["step"] = step
+        return await bridge.execute("rendering.render_sheet", params, timeout=_SHEET_TIMEOUT)
+    if views is not None or orbit is not None or by_attribute is not None or node is not None:
+        raise ValueError(
+            "hython=True renders a frame range only; views, orbit, by_attribute "
+            "and node need the viewport path (hython=False)."
+        )
+    if camera is not None and not isinstance(camera, str):
+        raise ValueError("hython=True takes a camera object path, not a view dict.")
     snapshot = await bridge.execute("scene.write_snapshot")
     hython = _hython_for(snapshot.get("houdini_version"))
     if hython is None:

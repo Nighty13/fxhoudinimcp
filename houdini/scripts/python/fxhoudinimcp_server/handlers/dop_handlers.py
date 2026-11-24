@@ -63,6 +63,46 @@ def _get_simulation(node_path: str) -> hou.DopSimulation:
     return sim
 
 
+# Reset Simulation buttons: DOP networks and most SOP-level solvers say
+# "resimulate"; the RBD Bullet Solver SOP says "resetsim". Missing the second
+# left a stale cache that read as "my fix had no effect" (notes 4d #3).
+_RESET_BUTTONS = ("resimulate", "resetsim")
+
+
+def reset_parm(node: Any) -> Any:
+    """*node*'s Reset Simulation button parm, or None."""
+    for name in _RESET_BUTTONS:
+        parm = None
+        with contextlib.suppress(Exception):
+            parm = node.parm(name)
+        if parm is not None:
+            return parm
+    return None
+
+
+def simulations_upstream(node: Any, limit: int = 500) -> list:
+    """The resettable simulations *node* reads: itself and everything upstream.
+
+    Followed by wire only. Each owner is the node reset_simulation would press
+    (lifted out of locked assets), listed once.
+    """
+    owners: list = []
+    seen: set[str] = set()
+    queue = [node]
+    while queue and len(seen) < limit:
+        current = queue.pop()
+        with contextlib.suppress(Exception):
+            if current.path() in seen:
+                continue
+            seen.add(current.path())
+            if reset_parm(current) is not None or _inside_dop(current):
+                owner = _simulation_to_reset(current)
+                if owner is not None and all(o.path() != owner.path() for o in owners):
+                    owners.append(owner)
+            queue.extend(i for i in current.inputs() if i is not None)
+    return owners
+
+
 def _reset_button_owner(node: hou.Node) -> hou.Node | None:
     """The node whose Reset Simulation button resets *node*'s simulation.
 
@@ -70,7 +110,7 @@ def _reset_button_owner(node: hou.Node) -> hou.Node | None:
     DOP network, or a SOP-level solver such as a POP Network), None if none.
     """
     owner = node
-    while owner is not None and owner.parm("resimulate") is None:
+    while owner is not None and reset_parm(owner) is None:
         owner = owner.parent()
     return owner
 
@@ -165,6 +205,22 @@ def _downstream(node: hou.Node) -> list[hou.Node]:
     return found
 
 
+# SOP-level solvers that carry a `resimulate` button but re-simulate by
+# themselves when their input changes. Measured on 22.0.508: a Heightfield
+# Erode's ranges moved after every upstream edit, so the note (~25 per
+# session) was wrong for them.
+_SELF_RESIMULATING = ("heightfield_erode",)
+
+
+def _resimulates_on_input_change(node: Any) -> bool:
+    with contextlib.suppress(Exception):
+        if _inside_dop(node):
+            return False
+        name = node.type().name().lower()
+        return any(name.startswith(prefix) for prefix in _SELF_RESIMULATING)
+    return False
+
+
 def dop_cache_note(nodes: Any, rewired: bool = False) -> dict[str, Any] | None:
     """The simulations an edit of *nodes* leaves with stale cooked frames, or None.
 
@@ -188,10 +244,12 @@ def dop_cache_note(nodes: Any, rewired: bool = False) -> dict[str, Any] | None:
             if _inside_dop(node):
                 add(_simulation_to_reset(node))
                 continue
-            if rewired and node.parm("resimulate") is not None:
+            if rewired and reset_parm(node) is not None:
                 add(_simulation_to_reset(node))
             for reader in _downstream(node):
-                if _inside_dop(reader) or reader.parm("resimulate") is not None:
+                if _resimulates_on_input_change(reader):
+                    continue
+                if _inside_dop(reader) or reset_parm(reader) is not None:
                     add(_simulation_to_reset(reader))
     if not networks:
         return None
@@ -658,7 +716,7 @@ def _reset_simulation(node_path: str) -> dict:
     owner = _reset_button_owner(node)
     if owner is None:
         raise ValueError(f"No Reset Simulation button on {node_path} or any of its parents.")
-    owner.parm("resimulate").pressButton()
+    reset_parm(owner).pressButton()
 
     start_frame, _ = hou.playbar.frameRange()
     hou.setFrame(start_frame)

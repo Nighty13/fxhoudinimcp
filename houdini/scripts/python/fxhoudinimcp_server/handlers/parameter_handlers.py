@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import time
 
 # Built-in
 from difflib import get_close_matches
@@ -22,7 +23,14 @@ from fxhoudinimcp_server.callbacks import CallbackError, _is_python, callback_sc
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
 from fxhoudinimcp_server.handlers.dop_handlers import dop_cache_note
+from fxhoudinimcp_server.menus import MenuScriptError, items_and_labels
 from fxhoudinimcp_server.menus import items as menu_items
+from fxhoudinimcp_server.parm_patterns import (
+    compile_patterns,
+    matches_any,
+    parm_matches,
+    term_matches,
+)
 from fxhoudinimcp_server.serialize import geometry_summary, ramp_to_dict
 
 ###### Helpers
@@ -343,6 +351,46 @@ def _template_to_dict(pt: hou.ParmTemplate) -> dict[str, Any]:
 
 ###### Handler: parameters.get_parameter
 
+# Menu entries get_parameter lists before it says `menu_truncated`.
+_MENU_CAP = 50
+
+
+def _menu_of(parm: hou.Parm, pt: hou.ParmTemplate) -> dict[str, Any]:
+    """`menu_items` / `menu_labels` / `menu_token` of a menu parm; {} for any other.
+
+    So a menu parm (int or string) can be set by token without pulling the
+    whole schema: Copy to Points' pivot is "origin"/"centroid". The template's
+    static items missed every generated menu (a group menu, an attribute
+    menu); menus.items_and_labels runs the generator as Houdini does, without
+    its modal error window. `menu_token` is the token selected now.
+    """
+    tokens: list[str] = []
+    labels: list[str] = []
+    try:
+        tokens, labels = items_and_labels(parm)
+    except MenuScriptError as exc:
+        return {"menu_error": str(exc).splitlines()[0]}
+    except Exception:
+        tokens = []
+    if not tokens:
+        # A parm that is not a menu raises above; its template answers too.
+        with contextlib.suppress(Exception):
+            tokens = list(pt.menuItems())
+            labels = list(pt.menuLabels())
+    if not isinstance(tokens, list) or not tokens:
+        return {}
+    found: dict[str, Any] = {
+        "menu_items": [str(t) for t in tokens[:_MENU_CAP]],
+        "menu_labels": [str(label) for label in labels[:_MENU_CAP]],
+    }
+    if len(tokens) > _MENU_CAP:
+        found["menu_truncated"] = len(tokens)
+    with contextlib.suppress(Exception):
+        token = parm.evalAsString()
+        if isinstance(token, str) and token in tokens:
+            found["menu_token"] = token
+    return found
+
 
 def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
     """Get the current value, expression, keyframe info, and metadata of a parameter."""
@@ -362,13 +410,7 @@ def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
     if data_parm:
         result["data"] = data_parm["data"]
 
-    # Menu tokens, so a menu parm (int or string) can be set by name without
-    # pulling the whole schema: Copy to Points' pivot is "origin"/"centroid".
-    with contextlib.suppress(Exception):
-        items = list(pt.menuItems()) if hasattr(pt, "menuItems") else []
-        if items:
-            result["menu_items"] = items
-            result["menu_labels"] = list(pt.menuLabels())
+    result.update(_menu_of(parm, pt))
 
     # Expression
     try:
@@ -863,15 +905,99 @@ def _set_tuple(
     return new_value, report
 
 
+#: Largest file from_file loads into a parm (a Python SOP of ~32k chars is typical).
+_FROM_FILE_CAP = 4 * 1024 * 1024
+
+
+def _expand_path(path: str) -> str:
+    """*path* with $HIP / $JOB / ~ expanded the way Houdini expands a file parm."""
+    text = str(path)
+    expanded = None
+    with contextlib.suppress(Exception):
+        expanded = hou.text.expandString(text)
+    if not isinstance(expanded, str):
+        with contextlib.suppress(Exception):
+            expanded = hou.expandString(text)
+    if not isinstance(expanded, str):
+        expanded = os.path.expandvars(text)
+    return os.path.expanduser(expanded)
+
+
+def read_value_file(path: str) -> tuple[str, str]:
+    """(text, expanded path) of a file whose content becomes a String parm's value.
+
+    Long snippets (a Python SOP's code, a VEX library) were sent whole on
+    every edit, twice per round trip; a file on disk is sent as a path and
+    stays diffable in git. Newlines are normalised to LF.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("from_file must be a file path ($HIP and $JOB are expanded).")
+    expanded = _expand_path(path)
+    if not os.path.isfile(expanded):
+        raise ValueError(f"from_file: no such file: {expanded} (from {path!r}).")
+    size = os.path.getsize(expanded)
+    if size > _FROM_FILE_CAP:
+        raise ValueError(f"from_file: {expanded} is {size} bytes, over {_FROM_FILE_CAP}.")
+    with open(expanded, encoding="utf-8") as handle:
+        text = handle.read()
+    return text.replace("\r\n", "\n"), expanded
+
+
+def _write_from_file(
+    parm: hou.Parm,
+    path: str,
+    override_expression: bool = False,
+    run_callbacks: bool = False,
+) -> dict[str, Any]:
+    """Load *path* into the String parm *parm*; answer with counts, never the text."""
+    is_string = True
+    with contextlib.suppress(Exception):
+        is_string = parm.parmTemplate().type() == hou.parmTemplateType.String
+    if not is_string:
+        raise ValueError(f"from_file sets String parameters; '{parm.name()}' is not one.")
+    text, expanded = read_value_file(path)
+    written = _write_parm(parm, text, override_expression, run_callbacks)
+    # The text is the caller's own file: echoing it back is what this avoids.
+    for key in ("new_value", "raw_value", "requested"):
+        written.pop(key, None)
+    stored = _raw_string(parm)
+    report: dict[str, Any] = {
+        "from_file": expanded,
+        "chars": len(text),
+        "lines": text.count("\n") + (0 if text.endswith("\n") or not text else 1),
+    }
+    if isinstance(stored, str):
+        report["stored_matches_file"] = stored.replace("\r\n", "\n") == text
+    report.update(written)
+    return report
+
+
 def _set_parameter(
     node_path: str,
     parm_name: str,
-    value: Any,
+    value: Any = None,
     override_expression: bool = False,
     run_callbacks: bool = False,
+    from_file: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
-    """Set a parameter value, auto-detecting the appropriate type."""
+    """Set a parameter value, auto-detecting the appropriate type.
+
+    *from_file* loads a String parameter's value from a file instead
+    ($HIP/$JOB expanded); the reply then gives `chars` and `lines`, not the text.
+    """
+    if from_file is not None:
+        if value is not None:
+            raise ValueError("Give value or from_file, not both.")
+        parm = _resolve_parm(node_path, parm_name)
+        result = {"node_path": node_path, "parm_name": parm_name}
+        result.update(
+            _write_from_file(parm, from_file, bool(override_expression), bool(run_callbacks))
+        )
+        return result
+    if value is None:
+        _resolve_node(node_path)  # a bad path is named first, not the missing value
+        raise ValueError("value is required (or from_file, for a String parameter).")
     if isinstance(value, (list, tuple)):
         new_value, report = _set_tuple(
             _resolve_node(node_path),
@@ -945,6 +1071,18 @@ def _set_parameters(
         # stored 0 and reported success, so the expression silently vanished.
         if isinstance(value, dict):
             parm = node.parm(name)
+            if parm is not None and set(value) == {"from_file"}:
+                # {"from_file": "$HIP/scripts/gen.py"}: the text stays on disk.
+                try:
+                    results.append(
+                        {
+                            "parm_name": name,
+                            **_write_from_file(parm, value["from_file"], override, callbacks),
+                        }
+                    )
+                except Exception as exc:
+                    errors.append(_error_entry(name, exc))
+                continue
             if parm is not None and is_ramp_value(value):
                 # A whole ramp at once; key by key through its multiparm
                 # (`ramp`, `ramp1pos`, `ramp1c`, ...) was the only way in.
@@ -1068,8 +1206,9 @@ register_handler("parameters.set_parameters", _set_parameters)
 def _get_parameter_schema(
     node_path: str,
     parm_name: str | None = None,
-    filter: str | None = None,
+    filter: str | list | None = None,
     parm_names: list | None = None,
+    patterns: str | list | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Get full parameter template info.
@@ -1077,11 +1216,19 @@ def _get_parameter_schema(
     If *parm_names* is given, return info for exactly those parameters
     (unknown names are listed in `not_found`).
     If *parm_name* is given, return info for that one parameter.
-    If *filter* is given, return only parameters whose name or label
-    contains the filter string (case-insensitive).
+    If *filter* (or its alias *patterns*, get_parameters' name) is given,
+    return only parameters whose name or label matches: a glob when it holds
+    ``*?[``, a substring otherwise, ``a|b`` for alternatives, case-insensitive.
     Otherwise return all non-hidden parameters.
     """
     node = _resolve_node(node_path)
+    if isinstance(parm_names, str):
+        parm_names = [parm_names]
+    wanted = []
+    for given in (filter, patterns):
+        if given:
+            wanted += [given] if isinstance(given, str) else list(given)
+    terms = compile_patterns(wanted)
 
     if parm_names:
         found, missing = [], []
@@ -1122,13 +1269,12 @@ def _get_parameter_schema(
 
     _walk(ptg.parmTemplates())
 
-    if filter:
-        f = filter.lower()
-        parm_infos = [p for p in parm_infos if f in p["name"].lower() or f in p["label"].lower()]
+    if terms is not None:
+        parm_infos = [p for p in parm_infos if matches_any(terms, p["name"], p["label"])]
 
     # Unfiltered this was every visible template with up to 50 menu items each:
     # 70 KB on a Pyro Solver. The first 60 in full, the rest by name.
-    shown = parm_infos if filter else parm_infos[:_SCHEMA_CAP]
+    shown = parm_infos if terms is not None else parm_infos[:_SCHEMA_CAP]
     result = {
         "node_path": node_path,
         "parameter_count": len(parm_infos),
@@ -1517,13 +1663,23 @@ def _link_parameters(
         reply.pop("value", None)
         reply["entries"] = dst.evalAsInt()
         reply["follows_source"] = _raw_entries_match(src, dst, linked["multiparm_links"])
+    warnings: list[str] = []
     src_kind = _channel_function(src)
     if src_kind != function:
-        reply["warning"] = (
+        warnings.append(
             f"'{dst.name()}' is a {'String' if function == 'chs' else 'numeric'} parameter "
             f"linked to a {'String' if src_kind == 'chs' else 'numeric'} source; "
             f"{function}() converts the value on read."
         )
+    if not multiparm and (_is_multiparm_parent(dst) or _is_multiparm_parent(src)):
+        # A ramp linked to a plain int (or the other way round) follows the
+        # count only: its keys stay its own.
+        warnings.append(
+            "Only one side is a ramp or multiparm, so only the entry count is linked, "
+            "not the entries; link two ramps (or two multiparms) to link their keys."
+        )
+    if warnings:
+        reply["warning"] = " ".join(warnings)
     return reply
 
 
@@ -1945,7 +2101,7 @@ def _ramp_key_folded(parm: hou.Parm, lowered: list[str] | None) -> bool:
     # index in the name sets one key apart. ramp2pos -> ramppos.
     name = parm.name().lower()
     generic = re.sub(r"\d+", "", name)
-    named_apart = any(p in name and p not in generic for p in lowered)
+    named_apart = any(term_matches(p, name) and not term_matches(p, generic) for p in lowered)
     return not named_apart
 
 
@@ -1969,12 +2125,12 @@ def _ramp_named_by_key(parm: hou.Parm, lowered: list[str] | None) -> bool:
 
 
 def _matches_patterns(parm: hou.Parm, lowered: list[str] | None) -> bool:
-    """Whether any lowered pattern is a substring of the parm's name or label."""
-    if lowered is None:
-        return True
-    name = parm.name().lower()
-    label = parm.parmTemplate().label().lower()
-    return any(p in name or p in label for p in lowered)
+    """Whether any compiled pattern matches the parm's name or label.
+
+    *lowered* comes from parm_patterns.compile_patterns: a glob when it holds
+    ``*?[``, a substring otherwise (see parm_patterns).
+    """
+    return parm_matches(parm, lowered)
 
 
 def _get_parameters(
@@ -2003,9 +2159,11 @@ def _get_parameters(
 
     Args:
         node_path: Node to read.
-        patterns: Substrings matched against parameter name and label. Omit for
-            every non-hidden parameter, up to the cap. Required with *inside*,
-            unless *non_default_only* or *value_contains*.
+        patterns: Matched against parameter name and label, case-insensitive:
+            a glob when the pattern holds ``*?[`` (``qa_*``), a substring
+            otherwise; ``a|b`` is two alternatives (see parm_patterns). Omit
+            for every non-hidden parameter, up to the cap. Required with
+            *inside*, unless *non_default_only* or *value_contains*.
         include_defaults: Also report whether each value is still the default,
             and, where it differs, the default itself (`default`, and
             `default_expression` when the template has one).
@@ -2053,7 +2211,7 @@ def _get_parameters(
 
     if isinstance(patterns, str):
         patterns = [patterns]
-    lowered = [p.lower() for p in patterns] if patterns else None
+    lowered = compile_patterns(patterns)
 
     values: dict[str, Any] = {}
     matched = 0
@@ -2140,7 +2298,7 @@ def _sweep_parameters(
             "is not an answer anyone can read. Name what to look for, e.g. ['file'], "
             "or ask for non_default_only=True or value_contains."
         )
-    lowered = [p.lower() for p in patterns] if patterns else None
+    lowered = compile_patterns(patterns)
     # A locked asset's instance stays (its interface is the user's); what is
     # inside it is the asset's own business -- unless the sweep was asked to
     # start inside one.
@@ -2801,3 +2959,276 @@ def _promote_vop_parameters(promotions: list, **_: Any) -> dict[str, Any]:
 
 
 register_handler("parameters.promote_vop_parameters", _promote_vop_parameters)
+
+
+###### Handler: parameters.sweep_parameter
+
+# Values one sweep visits before it is refused: each one is a cook.
+_SWEEP_VALUE_CAP = 64
+
+# Stats keys a sweep row keeps: the per-value comparison, not the full report.
+_SWEEP_STAT_KEYS = ("min", "max", "mean", "percentiles", "per_component", "value", "skipped")
+
+_MEASURE_KEYS = frozenset(
+    {"node", "attribs", "attrib_class", "percentiles", "detail_attribs", "parms", "expressions"}
+)
+
+
+def _no_undo():
+    """hou.undos.disabler(): a sweep restores what it changed, so it leaves no undo entry."""
+    with contextlib.suppress(Exception):
+        return hou.undos.disabler()
+    return contextlib.nullcontext()
+
+
+def _sweep_targets(node: hou.Node, parm_name: str) -> list[hou.Parm]:
+    """The component parms a sweep writes: one parm, or every component of a tuple."""
+    parm = node.parm(parm_name)
+    if parm is not None:
+        return [parm]
+    parm_tuple = node.parmTuple(parm_name)
+    if parm_tuple is not None:
+        return list(parm_tuple)
+    # Raises with the did-you-mean list.
+    return [_resolve_parm(node.path(), parm_name)]
+
+
+def _parm_state(parm: hou.Parm) -> dict[str, Any]:
+    """What restoring *parm* needs: its literal and its keyframes or expression."""
+    state: dict[str, Any] = {"keys": [], "expression": None}
+    with contextlib.suppress(Exception):
+        state["keys"] = list(parm.keyframes())
+    raw = _raw_string(parm)
+    state["literal"] = raw if raw is not None else parm.eval()
+    if len(state["keys"]) == 1:
+        # One key holding an expression is a driven parm, not an animation.
+        with contextlib.suppress(Exception):
+            state["expression"] = (parm.expression(), parm.expressionLanguage())
+    return state
+
+
+def _restore_parm(parm: hou.Parm, state: dict[str, Any]) -> None:
+    """Put *parm* back as _parm_state read it: literal, then expression or keys."""
+    with contextlib.suppress(Exception):
+        parm.deleteAllKeyframes()
+    parm.set(state["literal"])
+    if state["expression"] is not None:
+        parm.setExpression(*state["expression"])
+    elif state["keys"]:
+        parm.setKeyframes(state["keys"])
+
+
+def _menu_index(parm: hou.Parm, value: Any) -> Any:
+    """A menu token for an int menu parm becomes its index; anything else as given."""
+    if not isinstance(value, str) or _raw_string(parm) is not None:
+        return value
+    with contextlib.suppress(Exception):
+        tokens = list(menu_items(parm))
+        if value in tokens:
+            return tokens.index(value)
+    return value
+
+
+def _sweep_write(parms: list[hou.Parm], value: Any) -> None:
+    """Write one sweep value; a list goes to the tuple's components in order."""
+    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    if len(values) != len(parms):
+        raise ValueError(
+            f"'{parms[0].name()}' takes {len(parms)} component(s), got {len(values)}: {value!r}"
+        )
+    for parm, component in zip(parms, values, strict=True):
+        with contextlib.suppress(Exception):
+            parm.deleteAllKeyframes()  # an expression would keep winning
+        parm.set(_menu_index(parm, component))
+
+
+def _check_measures(measure: Any, default_node: str) -> list[dict[str, Any]]:
+    """The measure spec as a list of dicts, each with its `node`."""
+    if measure is None:
+        measure = {}
+    specs = measure if isinstance(measure, list) else [measure]
+    checked = []
+    for index, spec in enumerate(specs):
+        if not isinstance(spec, dict):
+            raise ValueError(f"measure[{index}] must be a dict, got {spec!r}")
+        unknown = sorted(set(spec) - _MEASURE_KEYS)
+        if unknown:
+            raise ValueError(
+                f"measure[{index}]: unknown key(s) {unknown}; known: {sorted(_MEASURE_KEYS)}"
+            )
+        spec = dict(spec)
+        spec.setdefault("node", default_node)
+        for key in ("attribs", "detail_attribs", "parms", "expressions"):
+            if isinstance(spec.get(key), str):
+                spec[key] = [spec[key]]
+        checked.append(spec)
+    return checked
+
+
+def _compact_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    """get_attrib_stats entries cut to what a per-value comparison reads."""
+    return {
+        name: {k: v for k, v in entry.items() if k in _SWEEP_STAT_KEYS} or entry
+        for name, entry in stats.items()
+    }
+
+
+def _measure_stats(path: str, spec: dict[str, Any]) -> dict[str, Any]:
+    from fxhoudinimcp_server.handlers import geometry_handlers
+
+    try:
+        percentiles = geometry_handlers._check_percentiles(spec.get("percentiles"))
+        stats = geometry_handlers._attrib_stats_once(
+            path, spec["attribs"], spec.get("attrib_class", "point"), percentiles
+        )
+    except Exception as exc:
+        return {"stats_error": str(exc)}
+    out: dict[str, Any] = {"stats": _compact_stats(stats.get("stats", {}))}
+    if stats.get("missing"):
+        out["missing"] = stats["missing"]
+    return out
+
+
+def _measure_expressions(node: hou.Node, expressions: list[str]) -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    previous = hou.pwd()
+    try:
+        hou.setPwd(node)
+        for expression in expressions:
+            try:
+                results[expression] = _serialize_value(hou.hscriptExpression(expression))
+            except Exception as exc:
+                results[expression] = {"error": readable_message(exc)}
+    finally:
+        with contextlib.suppress(Exception):
+            hou.setPwd(previous)
+    return results
+
+
+def _measure_once(spec: dict[str, Any]) -> dict[str, Any]:
+    """Cook spec['node'] and read what the spec names; errors are data, not raised."""
+    path = spec["node"]
+    node = hou.node(path)
+    if node is None:
+        return {"error": f"Node not found: {path}"}
+    out: dict[str, Any] = {}
+    started = time.perf_counter()
+    with contextlib.suppress(Exception):
+        node.cook(force=False)
+    out["cook_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    with contextlib.suppress(Exception):
+        errors = list(node.errors() or [])
+        if errors:
+            out["errors"] = [str(e).splitlines()[0] for e in errors[:3]]
+    geo = None
+    with contextlib.suppress(Exception):
+        geo = node.geometry()
+    if geo is not None:
+        with contextlib.suppress(Exception):
+            out["points"] = int(geo.intrinsicValue("pointcount"))
+            out["prims"] = int(geo.intrinsicValue("primitivecount"))
+    if spec.get("attribs"):
+        out.update(_measure_stats(path, spec))
+    if spec.get("detail_attribs"):
+        detail: dict[str, Any] = {}
+        for name in spec["detail_attribs"]:
+            try:
+                detail[name] = _serialize_value(geo.attribValue(name))
+            except Exception:
+                detail[name] = None
+        out["detail"] = detail
+    if spec.get("parms"):
+        values: dict[str, Any] = {}
+        for name in spec["parms"]:
+            try:
+                parm = hou.parm(name) if "/" in name else node.parm(name)
+                values[name] = _serialize_value(parm.eval())
+            except Exception:
+                values[name] = None
+        out["parms"] = values
+    if spec.get("expressions"):
+        out["expressions"] = _measure_expressions(node, spec["expressions"])
+    return out
+
+
+def _original_of(state: dict[str, Any]) -> Any:
+    if state["expression"] is not None:
+        return {"expression": state["expression"][0]}
+    if state["keys"]:
+        return {"keyframes": len(state["keys"])}
+    return _serialize_value(state["literal"])
+
+
+def _sweep_parameter(
+    node_path: str,
+    parm_name: str,
+    values: list,
+    measure: Any = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """Set a parm to each value in turn, cook and measure, then put it back.
+
+    "slide_strength 0 / 0.5 / 1 -> offset stats" was a python loop each time
+    (agent-ux-notes 4f#3, 4g#2, 4k#2, 4l#10). One row per value, in order; the
+    parm's literal, expression or keyframes are restored in a finally block,
+    with undo disabled, since nothing is left changed once it returns.
+
+    *measure* is a dict, or a list of dicts, each with:
+        node: the node to cook and read (default: the swept node).
+        attribs + attrib_class + percentiles: get_attrib_stats on that node,
+            compacted to min/max/mean (and percentiles, per component).
+        detail_attribs: detail attribute values.
+        parms: parameter values, by name on the node or by full path.
+        expressions: HScript expressions evaluated with the node as pwd.
+    Every row carries the node's point/prim counts, cook time and errors.
+    """
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError("values must be a non-empty list, one sweep step per entry.")
+    if len(values) > _SWEEP_VALUE_CAP:
+        raise ValueError(f"{len(values)} values; a sweep takes at most {_SWEEP_VALUE_CAP}.")
+    node = _resolve_node(node_path)
+    parms = _sweep_targets(node, parm_name)
+    for parm in parms:
+        if locked := locked_message(parm):
+            raise LockedParmError(locked)
+    specs = _check_measures(measure, node.path())
+    states = [_parm_state(parm) for parm in parms]
+    rows: list[dict[str, Any]] = []
+    restore_errors: list[str] = []
+    with _no_undo():
+        try:
+            for value in values:
+                row: dict[str, Any] = {"value": _serialize_value(value)}
+                try:
+                    _sweep_write(parms, value)
+                except Exception as exc:
+                    row["error"] = str(exc)
+                    rows.append(row)
+                    continue
+                measured = [_measure_once(spec) for spec in specs]
+                if len(measured) == 1:
+                    row.update(measured[0])
+                else:
+                    row["measures"] = measured
+                rows.append(row)
+        finally:
+            for parm, state in zip(parms, states, strict=True):
+                try:
+                    _restore_parm(parm, state)
+                except Exception as exc:
+                    restore_errors.append(f"{parm.name()}: {exc}")
+    original = [_original_of(state) for state in states]
+    reply: dict[str, Any] = {
+        "node_path": node.path(),
+        "parm_name": parm_name,
+        "measured": [spec["node"] for spec in specs],
+        "rows": rows,
+        "restored": not restore_errors,
+        "original": original[0] if len(original) == 1 else original,
+    }
+    if restore_errors:
+        reply["restore_errors"] = restore_errors
+    return reply
+
+
+register_handler("parameters.sweep_parameter", _sweep_parameter)

@@ -249,8 +249,14 @@ async def list_node_types(
     context: str,
     filter: str | None = None,
     limit: int = 200,
+    all_versions: bool = False,
 ) -> dict:
     """List available node types for a context category.
+
+    Only the newest version of each versioned type is listed
+    (labs::vertex_animation_textures::4.0, not 2.0 .. 3.0); the number of
+    older versions left out is in `older_versions_hidden`. all_versions=True
+    lists every version.
 
     IMPORTANT: Any context can have hundreds of node types (SOPs alone can
     exceed 800 in a production install). Always pass a `filter` keyword
@@ -262,9 +268,12 @@ async def list_node_types(
         context: Category name (e.g. 'Sop', 'Lop', 'Dop', 'Top', 'Cop2').
         filter: Substring to filter type name or label (case-insensitive).
         limit: Max entries to return (default 200, max recommended 200).
+        all_versions: List every version of a versioned type.
     """
     bridge = _get_bridge(ctx)
     params: dict = {"context": context, "limit": limit}
+    if all_versions:
+        params["all_versions"] = True
     if filter is not None:
         params["filter"] = filter
     return await bridge.execute("nodes.list_node_types", params)
@@ -728,11 +737,43 @@ async def tidy_network(
         sections: In reading order, each {"title": str, "nodes": [node names
             or paths], "note": optional one-line explanation,
             "color": optional [r, g, b] in 0..1}.
-        layout: Lay the children out first. Omit to follow the server's
-            auto-layout setting; pass True/False to override.
+        layout: Lay the children out first. Omit to follow this server's
+            auto-layout setting (FXHOUDINIMCP_AUTO_LAYOUT); pass True/False
+            to override.
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {"parent_path": parent_path, "sections": sections or []}
-    if layout is not None:
-        params["layout"] = layout
+    # The default is decided here, where FXHOUDINIMCP_AUTO_LAYOUT is set: the
+    # Houdini side read its own setting and laid out a network the server
+    # instructions say never to move.
+    params: dict[str, Any] = {
+        "parent_path": parent_path,
+        "sections": sections or [],
+        "layout": auto_layout_enabled() if layout is None else layout,
+    }
     return await bridge.execute("nodes.tidy_network", params)
+
+
+@mcp.tool()
+async def collapse_to_subnet(
+    ctx: Context,
+    parent_path: str,
+    node_names: list[str],
+    subnet_name: str | None = None,
+) -> dict:
+    """Collapse sibling nodes into one subnet, keeping their wires.
+
+    Use instead of execute_python for "wrap this section in a subnet / make
+    it an HDA". Houdini adds an `output0` on collapse; when the collapsed
+    nodes already include an Output SOP for that index the added one is
+    removed (`removed_auto_outputs`), so there is no duplicate output 0.
+
+    Args:
+        parent_path: Network holding the nodes (e.g. "/obj/geo1").
+        node_names: Names of the children to collapse.
+        subnet_name: Name of the new subnet (default "subnet1").
+    """
+    bridge = _get_bridge(ctx)
+    params: dict[str, Any] = {"parent_path": parent_path, "node_names": node_names}
+    if subnet_name is not None:
+        params["subnet_name"] = subnet_name
+    return await bridge.execute("nodes.collapse_to_subnet", params)

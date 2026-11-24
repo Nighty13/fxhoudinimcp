@@ -71,6 +71,12 @@ _FILE_CONTEXTS = {
     "anim.md": ["Sop", "Chop"],
     "ml.md": ["Sop", "Top"],
     "troubleshooting.md": ["Sop", "Lop", "Dop"],
+    "unreal_landscape.md": ["Sop"],
+    "game_assets.md": ["Sop", "Driver", "Object"],
+    "vat.md": ["Sop", "Driver"],
+    "niagara.md": ["Sop", "Driver"],
+    "roads_rivers.md": ["Sop"],
+    "mesh_qa.md": ["Sop"],
 }
 
 

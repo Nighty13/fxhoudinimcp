@@ -10,6 +10,7 @@ import contextlib
 
 # Built-in
 import logging
+import math
 import os
 import subprocess
 import tempfile
@@ -24,7 +25,25 @@ from fxhoudinimcp_server.callbacks import CallbackError, press
 from fxhoudinimcp_server.config import place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
-from fxhoudinimcp_server.handlers.viewport_handlers import _no_mplay
+from fxhoudinimcp_server.handlers.viewport_handlers import (
+    _DIRECTION_ANGLES,
+    _angles,
+    _apply_camera,
+    _camera_spec,
+    _capturable_node,
+    _direction_name,
+    _drawn_report,
+    _flipbook_resolution,
+    _flipbook_still,
+    _max_size_arg,
+    _no_mplay,
+    _resolution_arg,
+    _world_bounds,
+    isolate,
+    preserved_view,
+    scratch_child,
+    scratch_object,
+)
 from fxhoudinimcp_server.outputs import (
     at_frame,
     failure_verdict,
@@ -100,6 +119,10 @@ def render_viewport(
     output_path: str,
     resolution: list = None,
     camera: str = None,
+    node: str = None,
+    visualize: bool = False,
+    instances: str = None,
+    max_size: int = None,
 ) -> dict:
     """Capture the current viewport to an image file.
 
@@ -107,7 +130,23 @@ def render_viewport(
         output_path: Destination image path (e.g. .png, .jpg, .exr).
         resolution: Optional [width, height] override.
         camera: Optional camera node path to look through before capture.
+        node: Render only this SOP's (or object's) geometry, through a
+            temporary object merge; no display flag moves.
+        visualize: Draw a heightfield's layers (a temporary
+            heightfield_visualize on *node*, default the viewer's display
+            SOP), not the grey surface.
+        instances: Points to draw with it (e.g. scatter points), merged in.
+        max_size: Cap on the image's longer side, in pixels.
+
+    With node/visualize/instances the viewer is put back afterwards
+    (network, view, camera, Visible Objects) and the scratch nodes removed.
     """
+    if node is not None or visualize or instances is not None:
+        return _render_isolated(
+            output_path, resolution, camera, node, visualize, instances, max_size
+        )
+    if max_size is not None:
+        _max_size_arg(max_size)
     # Houdini variables ($JOB, $HIP) are expanded, as load_scene does: a
     # "$JOB/..." path reached os.makedirs or os.path as written and failed.
     output_path = hou.text.expandString(output_path)
@@ -149,6 +188,8 @@ def render_viewport(
 
     if resolution is not None and len(resolution) != 2:
         raise ValueError("resolution must be a list of [width, height]")
+    if max_size is not None:
+        resolution = _flipbook_resolution(viewport, resolution, max_size)
     _size_flipbook(settings, resolution)
 
     # Use the flipbook approach for a single-frame capture
@@ -169,6 +210,462 @@ def render_viewport(
         # Which network the image shows, and a note when it is a DOP view.
         **viewer_context(scene_viewer),
     }
+
+
+def _first_scene_viewer():
+    for pane_tab in hou.ui.paneTabs():
+        if pane_tab.type() == hou.paneTabType.SceneViewer:
+            return pane_tab
+    raise RuntimeError("No Scene Viewer pane found. A viewport must be open to capture.")
+
+
+def _displayed_sop(scene_viewer):
+    """The SOP the viewer draws (its network's display node), or a ValueError asking for node=."""
+    with contextlib.suppress(Exception):
+        network = scene_viewer.pwd()
+        if network.childTypeCategory() == hou.sopNodeTypeCategory():
+            shown = network.displayNode()
+            if shown is not None:
+                return shown
+    raise ValueError(
+        "The viewer is not inside a SOP network, so there is no display node to use: pass node=."
+    )
+
+
+def _merge_points(obj, shown, instances: str):
+    """Merge the points at *instances* (world space) after *shown*; the merge SOP."""
+    points = scratch_child(obj, "object_merge", "instances")
+    points.parm("objpath1").set(instances)
+    points.parm("xformtype").set(1)
+    merged = scratch_child(obj, "merge", "with_instances")
+    merged.setInput(0, shown)
+    merged.setInput(1, points)
+    return merged
+
+
+def _render_isolated(output_path, resolution, camera, node, visualize, instances, max_size) -> dict:
+    """render_viewport of one node (optionally visualised), through a scratch object."""
+    output_path = hou.text.expandString(output_path)
+    require_ui(
+        "capture a viewport screenshot",
+        alternative="For a rendered image without a UI, build a ROP and use start_render.",
+    )
+    size = _resolution_arg(resolution)
+    cap = _max_size_arg(max_size)
+    spec = _camera_spec(camera)
+    if instances is not None and hou.node(instances) is None:
+        raise ValueError(f"Node not found: {instances}")
+    out_dir = os.path.dirname(output_path)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    scene_viewer = _first_scene_viewer()
+    source = _capturable_node(node) if node is not None else _displayed_sop(scene_viewer)
+    cur_frame = hou.frame()
+    notes: list = []
+    with (
+        scratch_object([source.path()]) as (obj, merge),
+        keep_viewer_state(),
+        preserved_view(scene_viewer) as state,
+    ):
+        shown = merge
+        if visualize:
+            try:
+                shown = scratch_child(obj, "heightfield_visualize", "visualize")
+            except hou.OperationFailed as e:
+                raise ValueError(
+                    f"No heightfield_visualize SOP in this Houdini: {readable_message(e)}"
+                ) from e
+            shown.setInput(0, merge)
+        if instances is not None:
+            shown = _merge_points(obj, shown, instances)
+        shown.setDisplayFlag(True)
+        shown.setRenderFlag(True)
+        with contextlib.suppress(Exception):
+            errors = list(shown.errors())
+            if errors:
+                notes.append(f"{shown.type().name()} reported: {errors[0][:200]}")
+        viewport = scene_viewer.curViewport()
+        isolate(scene_viewer, viewport, obj)
+        box = _world_bounds(source)
+        state["view_changed"] = True
+        view: dict = {}
+        if spec is not None:
+            view = _apply_camera(scene_viewer, viewport, spec, box, state)
+        elif box is not None:
+            viewport.frameBoundingBox(hou.BoundingBox(*box))
+        drawn = _drawn_report(scene_viewer, viewport, source=source.path(), sop=shown)
+        flip_size = _flipbook_resolution(viewport, size, cap)
+        actual_path = _flipbook_still(scene_viewer, viewport, output_path, cur_frame, flip_size)
+    result = {
+        "success": True,
+        "output_path": actual_path,
+        "file_exists": os.path.isfile(actual_path),
+        "resolution": flip_size,
+        "camera": camera if isinstance(camera, str) else None,
+        "frame": cur_frame,
+        "node": source.path(),
+        "visualized": bool(visualize),
+        "drawn": drawn,
+        "restored": not state.get("not_restored"),
+    }
+    if view:
+        result["view_applied"] = view
+    if state.get("not_restored"):
+        result["not_restored"] = state["not_restored"]
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
+
+
+###### rendering.render_sheet
+
+_SHEET_MAX_TILES = 64
+_SHEET_TILE = [320, 240]
+#: Elevation of an orbit's views: looking down 25 degrees.
+_ORBIT_ELEVATION = -25.0
+
+
+def _sheet_grid(count: int, columns: int | None) -> tuple:
+    """(columns, rows) for *count* tiles: *columns* if given, else about square."""
+    cols = int(columns) if columns else math.ceil(math.sqrt(count))
+    cols = max(1, min(cols, count))
+    return cols, math.ceil(count / cols)
+
+
+def _sheet_tiles(
+    start=None,
+    end=None,
+    step=1,
+    views=None,
+    orbit=None,
+    elevation=None,
+    values=None,
+    attribute=None,
+) -> list:
+    """The tiles of a sheet, each {"label", and one of frame / angles / value}.
+
+    Exactly one source is used: a frame range, named or [rx, ry] views, an
+    orbit of N views, or the values of an attribute.
+    """
+    given = [
+        name
+        for name, value in (
+            ("start/end", start if start is not None else end),
+            ("views", views),
+            ("orbit", orbit),
+            ("by_attribute", values),
+        )
+        if value is not None
+    ]
+    if len(given) != 1:
+        raise ValueError(
+            "Pass exactly one of start/end (frames), views, orbit or by_attribute"
+            + (f"; got {', '.join(given)}." if given else ".")
+        )
+    tiles: list = []
+    if given[0] == "start/end":
+        if start is None or end is None:
+            raise ValueError("A frame sheet needs both start and end.")
+        step = int(step or 1)
+        frames = list(range(int(start), int(end) + 1, step)) if step >= 1 else []
+        tiles = [{"frame": f, "label": f"f{f}"} for f in frames]
+    elif given[0] == "views":
+        if isinstance(views, str) or not views:
+            raise ValueError("views must be a list of direction names or [rx, ry] pairs.")
+        for index, view in enumerate(views):
+            angles = _angles(view, f"views[{index}]")
+            label = (
+                _direction_name(view)
+                if isinstance(view, str)
+                else ",".join(f"{a:g}" for a in angles[:2])
+            )
+            tiles.append({"angles": angles, "label": label})
+    elif given[0] == "orbit":
+        if isinstance(orbit, bool) or not isinstance(orbit, int) or orbit < 2:
+            raise ValueError(f"orbit must be a number of views >= 2, got {orbit!r}")
+        tilt = _ORBIT_ELEVATION if elevation is None else float(elevation)
+        for index in range(orbit):
+            turn = round(index * 360.0 / orbit, 4)
+            tiles.append({"angles": (tilt, turn, 0.0), "label": f"ry {turn:g}"})
+    else:
+        tiles = [{"value": value, "label": f"{attribute}={value}"} for value in values]
+    if not 1 <= len(tiles) <= _SHEET_MAX_TILES:
+        raise ValueError(f"That gives {len(tiles)} tiles; a sheet takes 1 to {_SHEET_MAX_TILES}.")
+    return tiles
+
+
+def _attribute_values(geo, name: str) -> tuple:
+    """("prims" | "points", sorted unique values) of the int or string attribute *name*."""
+    from_class = (
+        ("prims", geo.findPrimAttrib, "prim"),
+        ("points", geo.findPointAttrib, "point"),
+    )
+    for group_type, find, prefix in from_class:
+        attrib = find(name)
+        if attrib is None:
+            continue
+        if attrib.size() != 1:
+            raise ValueError(
+                f"by_attribute needs a single-component attribute; {name} has {attrib.size()}."
+            )
+        data = attrib.dataType()
+        if data == hou.attribData.String:
+            values = getattr(geo, f"{prefix}StringAttribValues")(name)
+        elif data == hou.attribData.Int:
+            values = getattr(geo, f"{prefix}IntAttribValues")(name)
+        else:
+            raise ValueError(
+                f"by_attribute takes an integer or string attribute; {name} is {data}. "
+                "Bucket a float attribute into an integer one first."
+            )
+        return group_type, sorted(set(values))
+    raise ValueError(f"No primitive or point attribute '{name}' on the node's geometry.")
+
+
+def _group_for(name: str, value) -> str:
+    """An ad-hoc group selecting elements whose *name* is *value*."""
+    if isinstance(value, str):
+        return f'@{name}="{value}"'
+    return f"@{name}=={value}"
+
+
+def _set_menu(parm, token: str) -> None:
+    """Set a menu parm by its token, by index when the parm is an ordinal."""
+    with contextlib.suppress(Exception):
+        items = list(parm.menuItems())
+        if token in items:
+            parm.set(items.index(token))
+            return
+    parm.set(token)
+
+
+def _stitch_tiles(tiles: list, columns: int | None, output: str) -> dict:
+    """Tile *tiles* [(path, label)] into one image at *output*.
+
+    PIL when Houdini's Python has it, else OpenImageIO. Returns
+    {"stitched_with", "grid", "tile_resolution"} or {"stitched_with": None}.
+    """
+    present = [(path, label) for path, label in tiles if os.path.isfile(path)]
+    if not present:
+        return {"stitched_with": None}
+    cols, rows = _sheet_grid(len(present), columns)
+    out_dir = os.path.dirname(output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        Image = None
+    if Image is not None:
+        images = [(Image.open(path).convert("RGB"), label) for path, label in present]
+        width, height = images[0][0].size
+        sheet = Image.new("RGB", (cols * width, rows * height), (32, 32, 32))
+        draw = ImageDraw.Draw(sheet)
+        for index, (image, label) in enumerate(images):
+            if image.size != (width, height):
+                image = image.resize((width, height))
+            x, y = (index % cols) * width, (index // cols) * height
+            sheet.paste(image, (x, y))
+            draw.rectangle((x, y, x + 6 * len(label) + 8, y + 14), fill=(0, 0, 0))
+            draw.text((x + 3, y + 2), label, fill=(255, 255, 255))
+        sheet.save(output)
+        return {"stitched_with": "PIL", "grid": [cols, rows], "tile_resolution": [width, height]}
+    try:
+        import OpenImageIO as oiio
+    except ImportError:
+        return {"stitched_with": None}
+    buffers = [(oiio.ImageBuf(path), label) for path, label in present]
+    spec = buffers[0][0].spec()
+    width, height = spec.width, spec.height
+    sheet = oiio.ImageBuf(oiio.ImageSpec(cols * width, rows * height, 3, oiio.UINT8))
+    oiio.ImageBufAlgo.fill(sheet, (0.125, 0.125, 0.125))
+    for index, (buf, label) in enumerate(buffers):
+        x, y = (index % cols) * width, (index // cols) * height
+        oiio.ImageBufAlgo.paste(sheet, x, y, 0, 0, buf)
+        with contextlib.suppress(Exception):
+            oiio.ImageBufAlgo.render_text(sheet, x + 3, y + 14, label, 12)
+    if not sheet.write(output):
+        return {"stitched_with": None}
+    return {
+        "stitched_with": "OpenImageIO",
+        "grid": [cols, rows],
+        "tile_resolution": [width, height],
+    }
+
+
+def render_sheet(
+    output_path: str,
+    start: int = None,
+    end: int = None,
+    step: int = 1,
+    views: list = None,
+    orbit: int = None,
+    elevation: float = None,
+    by_attribute: str = None,
+    node: str = None,
+    camera=None,
+    resolution: list = None,
+    columns: int = None,
+    frame: float = None,
+) -> dict:
+    """Tile viewport captures into one contact sheet, inside this Houdini (no hython, no seat).
+
+    Args:
+        output_path: Sheet image path.
+        start, end, step: One tile per frame of the range.
+        views: One tile per view at one frame: direction names ('front',
+            'top', 'persp', ...) or [rx, ry] degrees, each framing the
+            subject in perspective.
+        orbit: One tile per view of an orbit of this many views around the
+            subject, looking down *elevation* degrees (default 25).
+        by_attribute: One tile per value of this integer or string prim (or
+            point) attribute on *node*: each piece is cut out with a temporary
+            blast and framed on its own.
+        node: Draw only this SOP's (or object's) geometry, through a temporary
+            object; no display flag moves. Required with by_attribute.
+        camera: A camera path to look through (frames only), or a view dict
+            as capture_screenshot takes; with views/orbit/by_attribute only
+            look_at, distance and clearance apply on top of each tile's angle.
+        resolution: [width, height] of each tile. Default [320, 240].
+        columns: Tiles per row. Default: about square.
+        frame: The frame for views/orbit/by_attribute (default: the current one).
+
+    The frame, viewer and view are put back afterwards and the scratch nodes
+    removed. Tiles are stitched with PIL, else OpenImageIO; with neither, the
+    reply lists the tile images instead.
+    """
+    output_path = hou.text.expandString(output_path)
+    require_ui(
+        "render a sheet through the viewport",
+        alternative="render_sheet(hython=True) renders it in a separate hython instead.",
+    )
+    size = _resolution_arg(resolution) or list(_SHEET_TILE)
+    spec = _camera_spec(camera)
+    if by_attribute is not None and node is None:
+        raise ValueError("by_attribute needs node=: the SOP whose pieces to show.")
+    source = _capturable_node(node) if node is not None else None
+    per_view = views is not None or orbit is not None or by_attribute is not None
+    if per_view and isinstance(spec, str):
+        raise ValueError(
+            "A camera path only fits a frame sheet: views, orbit and pieces each place the view."
+        )
+    if per_view and isinstance(spec, dict):
+        extra = sorted(set(spec) - {"look_at", "distance", "clearance", "direction"})
+        if extra or (views is not None or orbit is not None) and "direction" in spec:
+            raise ValueError(
+                "With views/orbit/by_attribute each tile sets the angle; camera may hold only "
+                "look_at, distance and clearance (and direction for by_attribute)."
+            )
+    if frame is not None:
+        float(frame)
+    values = None
+    group_type = None
+    if by_attribute is not None:
+        with at_frame(frame):
+            group_type, values = _attribute_values(source.geometry(), by_attribute)
+    tiles = _sheet_tiles(
+        start, end, step, views, orbit, elevation, values=values, attribute=by_attribute
+    )
+
+    scene_viewer = _first_scene_viewer()
+    folder = tempfile.mkdtemp(prefix="fxhoudinimcp_sheet_")
+    previous_frame = hou.frame()
+    written: list = []
+    with contextlib.ExitStack() as stack:
+        scratch = stack.enter_context(scratch_object([source.path()])) if source else None
+        stack.enter_context(keep_viewer_state())
+        state = stack.enter_context(preserved_view(scene_viewer))
+        state["view_changed"] = True
+        viewport = scene_viewer.curViewport()
+        box = None
+        piece = None
+        if scratch is not None:
+            obj, merge = scratch
+            isolate(scene_viewer, viewport, obj)
+            if by_attribute is not None:
+                piece = scratch_child(obj, "blast", "piece")
+                piece.setInput(0, merge)
+                _set_menu(piece.parm("grouptype"), group_type)
+                piece.parm("negate").set(1)
+                piece.setDisplayFlag(True)
+                piece.setRenderFlag(True)
+        try:
+            if frame is not None:
+                hou.setFrame(float(frame))
+            if scratch is not None and piece is None:
+                box = _world_bounds(source)
+            for index, tile in enumerate(tiles):
+                if "frame" in tile:
+                    hou.setFrame(tile["frame"])
+                if piece is not None:
+                    piece.parm("group").set(_group_for(by_attribute, tile["value"]))
+                    box = _piece_bounds(piece)
+                if "angles" in tile or piece is not None:
+                    view = dict(spec or {})
+                    view["direction"] = (
+                        tile.get("angles")
+                        or view.get("direction")
+                        or (
+                            *_DIRECTION_ANGLES["perspective"],
+                            0.0,
+                        )
+                    )
+                    if isinstance(view["direction"], str):
+                        view["direction"] = (*_DIRECTION_ANGLES[view["direction"]], 0.0)
+                    _apply_camera(scene_viewer, viewport, view, box, state)
+                elif index == 0:
+                    if spec is not None:
+                        _apply_camera(scene_viewer, viewport, spec, box, state)
+                    elif box is not None:
+                        viewport.frameBoundingBox(hou.BoundingBox(*box))
+                path = os.path.join(folder, f"tile_{index:03d}.png")
+                written.append(
+                    (
+                        _flipbook_still(scene_viewer, viewport, path, hou.frame(), size),
+                        tile["label"],
+                    )
+                )
+        finally:
+            hou.setFrame(previous_frame)
+    stitched = _stitch_tiles(written, columns, output_path)
+    missing = [label for path, label in written if not os.path.isfile(path)]
+    result = {
+        "success": stitched["stitched_with"] is not None,
+        "method": "viewport flipbook in this Houdini",
+        "tiles": len(written),
+        "labels": [label for _, label in written],
+        "tile_folder": folder,
+        "restored": not state.get("not_restored"),
+        **stitched,
+    }
+    if stitched["stitched_with"] is not None:
+        result["output_path"] = output_path
+        result["file_exists"] = os.path.isfile(output_path)
+    else:
+        result["tile_paths"] = [path for path, _ in written]
+        result["note"] = (
+            "Neither PIL nor OpenImageIO is importable in this Houdini's Python, so the tiles "
+            "were not stitched: open tile_paths."
+        )
+    if missing:
+        result["missing_tiles"] = missing
+    if state.get("not_restored"):
+        result["not_restored"] = state["not_restored"]
+    if by_attribute is not None:
+        result["by_attribute"] = by_attribute
+        result["values"] = values
+    if source is not None:
+        result["node"] = source.path()
+    return result
+
+
+def _piece_bounds(sop) -> list | None:
+    """World bounds of *sop* in the scratch object (which sits at the origin)."""
+    with contextlib.suppress(Exception):
+        box = sop.geometry().boundingBox()
+        if box.isValid():
+            return [*box.minvec(), *box.maxvec()]
+    return None
 
 
 ###### rendering.render_quad_view
@@ -1068,6 +1565,7 @@ def get_render_progress(node_path: str) -> dict:
 
 register_handler("rendering.render_viewport", render_viewport)
 register_handler("rendering.render_quad_view", render_quad_view)
+register_handler("rendering.render_sheet", render_sheet)
 register_handler("rendering.list_render_nodes", list_render_nodes)
 register_handler("rendering.get_render_settings", get_render_settings)
 register_handler("rendering.set_render_settings", set_render_settings)

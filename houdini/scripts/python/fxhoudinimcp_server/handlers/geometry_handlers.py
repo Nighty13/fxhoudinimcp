@@ -11,6 +11,7 @@ import collections
 import contextlib
 import math
 import random
+import re
 from typing import Any
 
 # Third-party
@@ -1118,6 +1119,12 @@ def _get_attrib_stats(
     group: str | None = None,
     unique: bool = False,
     distance_to: str | None = None,
+    group_by: str | None = None,
+    buckets: int | None = None,
+    bucket_size: float | None = None,
+    reduce: list[str] | None = None,
+    max_groups: int | None = None,
+    list_if_count_below: int | None = None,
 ) -> dict[str, Any]:
     """The statistics below, for one node now, or for several nodes over several frames.
 
@@ -1132,6 +1139,12 @@ def _get_attrib_stats(
     *unique* counts distinct values of integer and string attributes, and
     *distance_to* measures each point's distance to another SOP's surface. An
     attribute name written "age/life" is the ratio of two attributes.
+
+    *group_by* aggregates the attributes per value of another attribute (an
+    int or string, or a float with *buckets* / *bucket_size*): "water width
+    per row" is group_by="s", attribs=["uv"], the `spread` of uv.x. And
+    *list_if_count_below* lists the elements themselves when there are that
+    few of them: three waterfall points are three positions, not a mean.
     """
     if node_path is not None and node_paths:
         # node_paths used to win and node_path was dropped without a word.
@@ -1145,9 +1158,21 @@ def _get_attrib_stats(
     # The narrowing options are passed only when asked for.
     narrowing = {
         key: value
-        for key, value in (("group", group), ("unique", unique), ("distance_to", distance_to))
-        if value
+        for key, value in (
+            ("group", group),
+            ("unique", unique),
+            ("distance_to", distance_to),
+            ("group_by", group_by),
+            ("buckets", buckets),
+            ("bucket_size", bucket_size),
+            ("reduce", reduce),
+            ("max_groups", max_groups),
+            ("list_if_count_below", list_if_count_below),
+        )
+        if value or (key == "list_if_count_below" and value is not None)
     }
+    if (buckets or bucket_size or reduce) and not group_by:
+        raise ValueError("buckets, bucket_size and reduce go with group_by=<attribute>.")
     if frames is None and node_paths is None:
         return _attrib_stats_once(nodes[0], attribs, attrib_class, quantiles, **narrowing)
     wanted_frames = sorted({float(f) for f in frames}) if frames else [hou.frame()]
@@ -1200,6 +1225,12 @@ def _attrib_stats_once(
     group: str | None = None,
     unique: bool = False,
     distance_to: str | None = None,
+    group_by: str | None = None,
+    buckets: int | None = None,
+    bucket_size: float | None = None,
+    reduce: list[str] | None = None,
+    max_groups: int | None = None,
+    list_if_count_below: int | None = None,
 ) -> dict[str, Any]:
     """Aggregate statistics for numeric attributes: min, max, mean, sum.
 
@@ -1234,11 +1265,11 @@ def _attrib_stats_once(
     wanted = [name for name in wanted if name in available][:_STATS_ATTRIB_CAP]
 
     if cls == "detail":
-        if group or distance_to or ratios:
+        if group or distance_to or ratios or group_by or list_if_count_below is not None:
             # Refused rather than dropped: there is one detail element.
             raise ValueError(
-                "group, distance_to and attribute ratios apply to point and prim "
-                "statistics, not detail"
+                "group, group_by, list_if_count_below, distance_to and attribute ratios "
+                "apply to point, prim and vertex statistics, not detail"
             )
         # A detail attribute is a single value, so "statistics" is the value.
         stats = {name: {"value": _vec_to_list(geo.attribValue(available[name]))} for name in wanted}
@@ -1343,6 +1374,28 @@ def _attrib_stats_once(
         result["vertices_per_prim"] = _vertices_per_prim(geo, rows)
     if distance_to:
         result["distance_to"] = _distance_stats(geo, cls, distance_to, rows, percentiles)
+    if group_by:
+        result["group_by"] = _group_by_report(
+            geo,
+            cls,
+            available,
+            group_by,
+            [name for name in wanted if name != group_by],
+            rows,
+            buckets=buckets,
+            bucket_size=bucket_size,
+            reduce=reduce,
+            max_groups=max_groups or _MAX_GROUPS,
+        )
+    if list_if_count_below is not None:
+        shown = min(int(list_if_count_below), _LIST_ELEMENTS_CAP)
+        if result["element_count"] <= shown:
+            result["elements"] = _list_elements(geo, cls, available, wanted, rows)
+        else:
+            result["elements_note"] = (
+                f"{result['element_count']} elements, more than list_if_count_below="
+                f"{shown}: statistics only."
+            )
     return result
 
 
@@ -1547,6 +1600,266 @@ def _numpy_stats(
     if counted is not None:
         entry.update(counted)
     return entry
+
+
+###### group_by / list_if_count_below (get_attrib_stats)
+
+
+_MAX_GROUPS = 50
+_LIST_ELEMENTS_CAP = 500
+_AUTO_BUCKETS = 10
+_REDUCERS = ("count", "min", "max", "mean", "spread", "sum", "median")
+_DEFAULT_REDUCE = ("min", "max", "mean", "spread")
+_COMPONENT_LETTERS = {"x": 0, "y": 1, "z": 2, "w": 3, "r": 0, "g": 1, "b": 2, "a": 3}
+_COMPONENT_SPEC = re.compile(
+    r"^(?P<name>[A-Za-z_]\w*)(?:\.(?P<letter>[xyzwrgba])|\[(?P<index>\d+)\])?$"
+)
+
+
+def _split_component(spec: str) -> tuple[str, int | None]:
+    """'P.y' -> ('P', 1), 'uv[0]' -> ('uv', 0), 'fuel' -> ('fuel', None)."""
+    found = _COMPONENT_SPEC.match(spec.strip())
+    if not found:
+        raise ValueError(f"'{spec}' is not an attribute name, 'name.x|y|z|w' or 'name[i]'.")
+    if found.group("letter"):
+        return found.group("name"), _COMPONENT_LETTERS[found.group("letter")]
+    if found.group("index") is not None:
+        return found.group("name"), int(found.group("index"))
+    return found.group("name"), None
+
+
+def _attrib_column(geo, cls: str, attrib) -> tuple[str, Any]:
+    """('Int'|'Float', array (n, size)) or ('String', list) for one attribute, every element.
+
+    One {cls}{Kind}AttribValues call; raises ValueError when the class has none
+    (an array attribute, or a vertex class on a build without the bulk call).
+    """
+    import numpy as np
+
+    name = attrib.name()
+    if attrib.isArrayType():
+        raise ValueError(f"'{name}' is an array attribute")
+    size = max(attrib.size(), 1)
+    if attrib.dataType() == hou.attribData.String:
+        flat = list(getattr(geo, f"{cls}StringAttribValues")(name))
+        if size > 1:
+            return "String", [tuple(flat[i : i + size]) for i in range(0, len(flat), size)]
+        return "String", flat
+    kind = "Int" if attrib.dataType() == hou.attribData.Int else "Float"
+    try:
+        flat = list(getattr(geo, f"{cls}{kind}AttribValues")(name))
+    except (AttributeError, hou.OperationFailed) as exc:
+        raise ValueError(f"'{name}' cannot be read in bulk on {cls}s: {exc}") from None
+    return kind, np.asarray(flat, dtype=np.float64).reshape(-1, size)
+
+
+def _reduce_column(values, reducers: list[str]) -> dict[str, Any]:
+    """The reducers over a (n, size) array: a number per reducer, a list per component."""
+    import numpy as np
+
+    out: dict[str, Any] = {}
+    for reducer in reducers:
+        if reducer == "count":
+            continue  # the group's count is reported once, beside the key
+        if reducer == "min":
+            found = values.min(axis=0)
+        elif reducer == "max":
+            found = values.max(axis=0)
+        elif reducer == "mean":
+            found = values.mean(axis=0)
+        elif reducer == "spread":
+            found = values.max(axis=0) - values.min(axis=0)
+        elif reducer == "sum":
+            found = values.sum(axis=0)
+        else:  # median
+            found = np.median(values, axis=0)
+        out[reducer] = float(found[0]) if found.size == 1 else [float(v) for v in found]
+    return out
+
+
+def _check_reducers(reduce: list[str] | str | None) -> list[str]:
+    if reduce is None:
+        return list(_DEFAULT_REDUCE)
+    if isinstance(reduce, str):
+        reduce = [reduce]
+    unknown = [r for r in reduce if r not in _REDUCERS]
+    if unknown:
+        raise ValueError(f"Unknown reduce {unknown}; use any of {list(_REDUCERS)}.")
+    return list(reduce)
+
+
+def _group_by_table(
+    keys: Any,
+    columns: dict[str, Any],
+    *,
+    numeric: bool,
+    integer: bool = False,
+    buckets: int | None = None,
+    bucket_size: float | None = None,
+    reduce: list[str] | str | None = None,
+    max_groups: int = _MAX_GROUPS,
+) -> dict[str, Any]:
+    """Aggregate each column per key value, or per numeric bucket of the key.
+
+    Pure: *keys* is one value per element (numbers or strings), *columns*
+    maps a name to an (n, size) float array of the same length. Numeric keys
+    are grouped per exact value (a float that is constant per row, like a
+    curve's `s`, groups that way), or into *buckets* equal-width bins over
+    their range, or into bins of *bucket_size* aligned to 0. Past *max_groups*
+    distinct values a numeric key is bucketed into 10 bins instead, and a
+    string key keeps its most common values. Empty buckets are not listed.
+    """
+    import numpy as np
+
+    reducers = _check_reducers(reduce)
+    if buckets is not None and bucket_size is not None:
+        raise ValueError("Pass buckets or bucket_size, not both.")
+    if (buckets is not None or bucket_size is not None) and not numeric:
+        raise ValueError("buckets and bucket_size need a numeric group_by attribute.")
+    if buckets is not None and int(buckets) < 1:
+        raise ValueError("buckets must be at least 1.")
+    if bucket_size is not None and not float(bucket_size) > 0:
+        raise ValueError("bucket_size must be greater than 0.")
+    if not len(keys):
+        return {"group_count": 0, "reduce": reducers, "groups": []}
+    notes: list[str] = []
+    ranges: list[list[float]] | None = None
+    labels: list[Any]
+    if numeric:
+        values = np.asarray(keys, dtype=np.float64)
+        distinct = np.unique(values)
+        if buckets is None and bucket_size is None and distinct.size > max_groups:
+            buckets = _AUTO_BUCKETS
+            notes.append(
+                f"{distinct.size} distinct values: bucketed into {_AUTO_BUCKETS}. "
+                "Pass buckets or bucket_size to choose."
+            )
+        if bucket_size is not None:
+            size = float(bucket_size)
+            index = np.floor(values / size).astype(np.int64)
+            found, inverse = np.unique(index, return_inverse=True)
+            ranges = [[float(i) * size, float(i + 1) * size] for i in found]
+            labels = [None] * len(found)
+        elif buckets is not None:
+            n = int(buckets)
+            low, high = float(values.min()), float(values.max())
+            width = (high - low) / n if high > low else 1.0
+            index = np.clip(np.floor((values - low) / width), 0, n - 1).astype(np.int64)
+            found, inverse = np.unique(index, return_inverse=True)
+            ranges = [[low + float(i) * width, low + float(i + 1) * width] for i in found]
+            labels = [None] * len(found)
+        else:
+            found, inverse = np.unique(values, return_inverse=True)
+            labels = [int(v) if integer else float(v) for v in found]
+        order = list(range(len(labels)))
+    else:
+        counted = collections.Counter(keys)
+        labels = list(counted)
+        position = {label: i for i, label in enumerate(labels)}
+        inverse = np.asarray([position[k] for k in keys], dtype=np.int64)
+        order = sorted(range(len(labels)), key=lambda i: str(labels[i]))
+        if len(labels) > max_groups:
+            notes.append(f"{len(labels)} distinct values: the {max_groups} most common are listed.")
+            keep = {position[k] for k, _ in counted.most_common(max_groups)}
+            order = [i for i in order if i in keep]
+    inverse = np.asarray(inverse).ravel()
+    if len(order) > max_groups:
+        notes.append(f"{len(order)} groups: the first {max_groups} are listed.")
+    groups = []
+    for i in order[:max_groups]:
+        mask = inverse == i
+        row: dict[str, Any] = {}
+        if ranges is not None:
+            row["range"] = ranges[i]
+        else:
+            row["key"] = list(labels[i]) if isinstance(labels[i], tuple) else labels[i]
+        row["count"] = int(mask.sum())
+        for name, column in columns.items():
+            row[name] = _reduce_column(column[mask], reducers)
+        groups.append(row)
+    report: dict[str, Any] = {"group_count": len(labels), "reduce": reducers, "groups": groups}
+    if notes:
+        report["note"] = " ".join(notes)
+    return report
+
+
+def _group_by_report(
+    geo,
+    cls: str,
+    available: dict,
+    group_by: str,
+    names: list[str],
+    rows: list[int] | None,
+    **options: Any,
+) -> dict[str, Any]:
+    """Read the key and value columns, narrow to *rows*, and hand them to _group_by_table."""
+    import numpy as np
+
+    key_name, component = _split_component(group_by)
+    key_attrib = available.get(key_name)
+    if key_attrib is None:
+        raise ValueError(
+            f"No {cls} attribute '{key_name}' to group by. It has: {', '.join(sorted(available))}."
+        )
+    kind, keys = _attrib_column(geo, cls, key_attrib)
+    if kind == "String":
+        if component is not None:
+            keys = [k[component] if isinstance(k, tuple) else k for k in keys]
+    else:
+        if keys.shape[1] > 1 and component is None:
+            raise ValueError(
+                f"'{key_name}' has {keys.shape[1]} components: group by one, e.g. "
+                f"'{key_name}.x' or '{key_name}[0]'."
+            )
+        keys = keys[:, component or 0]
+    columns: dict[str, Any] = {}
+    skipped: list[str] = []
+    for name in names:
+        attrib = available[name]
+        if attrib.isArrayType() or attrib.dataType() == hou.attribData.String:
+            skipped.append(name)
+            continue
+        columns[name] = _attrib_column(geo, cls, attrib)[1]
+    if rows is not None:
+        picked = np.asarray(rows, dtype=np.int64)
+        keys = [keys[r] for r in rows] if kind == "String" else keys[picked]
+        columns = {name: column[picked] for name, column in columns.items()}
+    report = {
+        "attribute": group_by,
+        **_group_by_table(
+            keys, columns, numeric=kind != "String", integer=kind == "Int", **options
+        ),
+    }
+    if skipped:
+        report["not_aggregated"] = skipped
+    return report
+
+
+def _element_value(kind: str, column: Any, row: int) -> Any:
+    if kind == "String":
+        value = column[row]
+        return list(value) if isinstance(value, tuple) else value
+    values = column[row]
+    cast = int if kind == "Int" else float
+    return cast(values[0]) if len(values) == 1 else [cast(v) for v in values]
+
+
+def _list_elements(geo, cls: str, available: dict, names: list[str], rows: list[int] | None):
+    """Each element's number and its values of *names*, for a group small enough to read."""
+    columns = {}
+    for name in names:
+        with contextlib.suppress(Exception):
+            columns[name] = _attrib_column(geo, cls, available[name])
+    if rows is None:
+        total = max((len(column) for _, column in columns.values()), default=0)
+        rows = list(range(total))
+    return [
+        {
+            "index": row,
+            **{name: _element_value(kind, column, row) for name, (kind, column) in columns.items()},
+        }
+        for row in rows
+    ]
 
 
 register_handler("geometry.get_attrib_stats", _get_attrib_stats)
@@ -1786,6 +2099,7 @@ def _get_volume_info(
     max_volumes: int = 24,
     threshold: float | None = None,
     bins: Any = 0,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Per-volume names, resolution, active voxels and value ranges.
 
@@ -1796,6 +2110,10 @@ def _get_volume_info(
     Without threshold or bins only intrinsics are read. With either, the voxels
     are read once per volume for percentiles, a histogram, the split at the
     threshold and the world box of the voxels over it.
+
+    *compact* answers a table, one row per volume (name, resolution, bounds,
+    voxel size, min/max/mean, and p50/p95/share above threshold when voxels
+    were read): a 4-8 layer heightfield cost ~3k chars per call as entries.
     """
     geo = _get_sop_geo(node_path)
     volumes = _volume_prims(geo)
@@ -1814,12 +2132,67 @@ def _get_volume_info(
             if threshold is not None and array.size:
                 entry["box_above_threshold"] = _box_above(prim, array, origin, threshold)
         entries.append(entry)
+    if compact:
+        return {
+            "node_path": node_path,
+            "volume_count": len(volumes),
+            **_compact_volume_table(entries),
+            "truncated": len(volumes) > len(shown),
+        }
     return {
         "node_path": node_path,
         "volume_count": len(volumes),
         "volumes": entries,
         "truncated": len(volumes) > len(shown),
     }
+
+
+def _short(value: Any) -> Any:
+    """A float to 6 significant digits, a list of them, or the value as it is."""
+    if isinstance(value, float):
+        return float(f"{value:.6g}")
+    if isinstance(value, (list, tuple)):
+        return [_short(v) for v in value]
+    return value
+
+
+def _compact_volume_table(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """get_volume_info entries as columns + one row per volume (pure).
+
+    voxel is one number when the voxel is a cube (a heightfield's is), the
+    three sizes otherwise. p50/p95 come from the voxel read (threshold or
+    bins); share_above from the threshold split.
+    """
+    columns = ["name", "res", "bbox_min", "bbox_max", "voxel", "min", "max", "mean"]
+    read = any("voxel_stats" in entry for entry in entries)
+    split = any("threshold" in entry.get("voxel_stats", {}) for entry in entries)
+    if read:
+        columns += ["p50", "p95"]
+    if split:
+        columns.append("share_above")
+    rows = []
+    for entry in entries:
+        voxel = entry.get("voxel_size")
+        if isinstance(voxel, (list, tuple)) and voxel and all(v == voxel[0] for v in voxel):
+            voxel = voxel[0]
+        row = [
+            entry.get("name", ""),
+            entry.get("resolution"),
+            _short(entry.get("bbox_min")),
+            _short(entry.get("bbox_max")),
+            _short(voxel),
+            _short(entry.get("min_value")),
+            _short(entry.get("max_value")),
+            _short(entry.get("mean_value")),
+        ]
+        stats = entry.get("voxel_stats", {})
+        if read:
+            quantiles = stats.get("percentiles", {})
+            row += [_short(quantiles.get("50")), _short(quantiles.get("95"))]
+        if split:
+            row.append(stats.get("threshold", {}).get("share_above"))
+        rows.append(row)
+    return {"columns": columns, "rows": rows}
 
 
 register_handler("geometry.get_volume_info", _get_volume_info)
@@ -1848,20 +2221,196 @@ def _read_fields_at(geo: hou.Geometry, fields: list[str], points: hou.Geometry) 
     return found
 
 
+_DELTA_PERCENTILES = (1, 5, 50, 95, 99)
+_DELTA_BINS = 8
+_WORST_CAP = 50
+
+
+def _column_key(path: str, field: str, nodes: list[str], fields: list[str]) -> str:
+    """One node: the field name (as before). Several: the node path, or path:field."""
+    if len(nodes) == 1:
+        return field
+    return path if len(fields) == 1 else f"{path}:{field}"
+
+
+def _delta_report(
+    delta: Any, *, tolerance: float = 0.0, bins: Any = 0, worst: int = 5
+) -> tuple[dict[str, Any], list[int], list[int]]:
+    """Summary of a per-point signed difference, and the worst points on each side (pure).
+
+    Returns (summary, above, below): *above* the indices of the largest
+    positive deltas beyond *tolerance*, largest first, *below* the most
+    negative ones. A non-finite delta (a field that read NaN) is counted, not
+    used.
+    """
+    import numpy as np
+
+    delta = np.asarray(delta, dtype=np.float64).ravel()
+    finite = np.isfinite(delta)
+    values = delta[finite]
+    tolerance = abs(float(tolerance))
+    if not values.size:
+        return {"count": 0, "non_finite": int((~finite).sum())}, [], []
+    above_mask = finite & (delta > tolerance)
+    below_mask = finite & (delta < -tolerance)
+    above_n, below_n = int(above_mask.sum()), int(below_mask.sum())
+    summary: dict[str, Any] = {
+        "count": int(values.size),
+        "min": float(values.min()),
+        "max": float(values.max()),
+        "mean": float(values.mean()),
+        "mean_abs": float(np.abs(values).mean()),
+        "percentiles": {
+            str(q): float(v)
+            for q, v in zip(
+                _DELTA_PERCENTILES, np.percentile(values, _DELTA_PERCENTILES), strict=True
+            )
+        },
+        "tolerance": tolerance,
+        "above": above_n,
+        "below": below_n,
+        "within": int(values.size) - above_n - below_n,
+        "share_above": round(above_n / values.size, 4),
+        "share_below": round(below_n / values.size, 4),
+    }
+    if int((~finite).sum()):
+        summary["non_finite"] = int((~finite).sum())
+    counts, edges = np.histogram(values, bins=_edges(bins) if bins else _DELTA_BINS)
+    summary["histogram"] = {
+        "edges": [float(e) for e in edges],
+        "counts": [int(c) for c in counts],
+    }
+    worst = max(0, min(int(worst), _WORST_CAP))
+    indices = np.arange(delta.size)
+    above = indices[above_mask][np.argsort(-delta[above_mask], kind="stable")][:worst]
+    below = indices[below_mask][np.argsort(delta[below_mask], kind="stable")][:worst]
+    return summary, [int(i) for i in above], [int(i) for i in below]
+
+
+def _point_component(points: hou.Geometry, spec: str) -> Any:
+    """One number per point from an attribute spec like 'P.y', 'height' or 'uv[0]'."""
+    import numpy as np
+
+    name, component = _split_component(spec)
+    attrib = points.findPointAttrib(name)
+    if attrib is None:
+        have = sorted(a.name() for a in points.pointAttribs())
+        raise ValueError(
+            f"compare_to '{spec}' is not a sampled column, a number or a point attribute. "
+            f"Point attributes: {', '.join(have) or 'none'}."
+        )
+    kind, column = _attrib_column(points, "point", attrib)
+    if kind == "String":
+        raise ValueError(f"compare_to '{spec}' is a string attribute.")
+    if column.shape[1] > 1 and component is None:
+        raise ValueError(f"'{name}' has {column.shape[1]} components: pick one, e.g. '{name}.y'.")
+    index = component or 0
+    if index >= column.shape[1]:
+        raise ValueError(f"'{name}' has {column.shape[1]} components, not {index + 1}.")
+    return np.asarray(column[:, index], dtype=np.float64)
+
+
+def _reference_column(spec: Any, columns: dict[str, Any], points: hou.Geometry):
+    """(label, column key or None, values): a sampled column, a constant, or a point attribute component."""
+    import numpy as np
+
+    if isinstance(spec, (int, float)):
+        return f"{spec:g}", None, float(spec)
+    text = str(spec).strip()
+    if text in columns:
+        return text, text, columns[text]
+    # A node path's last component names its column when that is unambiguous.
+    by_name = [key for key in columns if key.rsplit("/", 1)[-1].split(":")[0] == text]
+    if len(by_name) == 1:
+        return by_name[0], by_name[0], columns[by_name[0]]
+    with contextlib.suppress(ValueError):
+        return text, None, float(text)
+    values = _point_component(points, text)
+    count = len(next(iter(columns.values())))
+    if values.size != count:
+        raise ValueError(f"compare_to '{text}' has {values.size} values for {count} samples.")
+    return text, None, np.asarray(values)
+
+
+def _worst_rows(
+    indices: list[int],
+    delta: Any,
+    value: Any,
+    reference: Any,
+    positions: Any,
+    points: hou.Geometry | None,
+    attribs: list[str],
+) -> list[dict[str, Any]]:
+    rows = []
+    for i in indices:
+        row: dict[str, Any] = {"point": i, "delta": float(delta[i]), "value": float(value[i])}
+        row["reference"] = float(reference if not hasattr(reference, "__len__") else reference[i])
+        if positions is not None and i < len(positions):
+            row["P"] = [float(c) for c in positions[i]]
+        if points is not None and attribs:
+            with contextlib.suppress(Exception):
+                point = points.point(i)
+                for name in attribs:
+                    with contextlib.suppress(Exception):
+                        value = point.attribValue(name)
+                        row[name] = list(value) if isinstance(value, tuple) else value
+        rows.append(row)
+    return rows
+
+
+def _point_positions(points: hou.Geometry):
+    import numpy as np
+
+    try:
+        return np.asarray(list(points.pointFloatAttribValues("P")), dtype=np.float64).reshape(-1, 3)
+    except Exception:
+        return None
+
+
 def _sample_volume(
     *,
-    node_path: str,
-    fields: list[str],
+    node_path: str | None = None,
+    fields: list[str] | str | None = None,
     positions: list | None = None,
     from_node: str | None = None,
     limit: int = 1000,
     bins: Any = 0,
     threshold: float | None = None,
+    node_paths: list[str] | None = None,
+    compare_to: Any = None,
+    tolerance: float = 0.0,
+    worst: int = 5,
+    attribs: list[str] | None = None,
+    include_values: bool | None = None,
 ) -> dict[str, Any]:
-    """Named volumes read at world positions, or at another node's points."""
-    geo = _get_sop_geo(node_path)
-    for field in fields:
-        _named_volume(geo, field, node_path)
+    """Named volumes read at world positions, or at another node's points.
+
+    *node_paths* reads the same fields from several volume / heightfield
+    nodes at the same points, a column each. *compare_to* ("P.y", another
+    point attribute or component, a number, or one of the sampled columns:
+    its key, or its node's name) adds a per-point signed difference, column
+    minus reference, for every other column: percentiles, counts beyond
+    *tolerance* on each side, a histogram, and the *worst* points on each
+    side with their number, P and the point *attribs* asked for. Water point
+    Y against the terrain under it was 6 of 9 execute_python calls in a pass.
+
+    Values per point come back when asked (*include_values*), up to *limit*;
+    without compare_to the old rule holds: values when there are at most
+    *limit* positions.
+    """
+    if node_path and node_paths:
+        raise ValueError("Pass either node_path or node_paths, not both.")
+    nodes = list(node_paths or ([node_path] if node_path else []))
+    if not nodes:
+        raise ValueError("Pass node_path, or node_paths for several volume nodes.")
+    if isinstance(fields, str):
+        fields = [fields]
+    fields = list(fields or ["height"])
+    geos = {}
+    for path in nodes:
+        geos[path] = _get_sop_geo(path)
+        for field in fields:
+            _named_volume(geos[path], field, path)
     if from_node:
         points = _get_sop_geo(from_node)
     elif positions:
@@ -1870,19 +2419,51 @@ def _sample_volume(
         raise ValueError(
             "Give positions ([[x, y, z], ...]) or from_node (a SOP whose points to read at)."
         )
-    read = _read_fields_at(geo, fields, points)
-    count = len(next(iter(read.values()))) if read else 0
-    report: dict[str, Any] = {
-        "node_path": node_path,
-        "positions": count,
-        "summary": {
-            field: _value_summary(values, bins, threshold) for field, values in read.items()
-        },
+    columns: dict[str, Any] = {}
+    for path in nodes:
+        for field, values in _read_fields_at(geos[path], fields, points).items():
+            columns[_column_key(path, field, nodes, fields)] = values
+    count = len(next(iter(columns.values()))) if columns else 0
+    report: dict[str, Any] = {"node_path": nodes[0]} if len(nodes) == 1 else {"node_paths": nodes}
+    report["positions"] = count
+    report["summary"] = {
+        key: _value_summary(values, bins, threshold) for key, values in columns.items()
     }
-    if count <= limit:
-        report["values"] = {field: values.tolist() for field, values in read.items()}
-    else:
-        report["note"] = f"{count} positions: summary only. Raise limit for the values."
+    deltas: dict[str, Any] = {}
+    if compare_to is not None:
+        label, reference_key, reference = _reference_column(compare_to, columns, points)
+        compared = [key for key in columns if key != reference_key]
+        if not compared:
+            raise ValueError(
+                f"compare_to '{label}' is the only sampled column: nothing to compare."
+            )
+        point_positions = _point_positions(points)
+        comparisons = {}
+        for key in compared:
+            delta = columns[key] - reference
+            deltas[key] = delta
+            summary, above, below = _delta_report(
+                delta, tolerance=tolerance, bins=bins, worst=worst
+            )
+            summary["worst_above"] = _worst_rows(
+                above, delta, columns[key], reference, point_positions, points, attribs or []
+            )
+            summary["worst_below"] = _worst_rows(
+                below, delta, columns[key], reference, point_positions, points, attribs or []
+            )
+            comparisons[key] = summary
+        report["compare"] = {"reference": label, "delta": "column - reference", **comparisons}
+    if include_values is None:
+        include_values = compare_to is None and count <= limit
+        if not include_values and compare_to is None:
+            report["note"] = f"{count} positions: summary only. Raise limit for the values."
+    if include_values:
+        shown = min(count, max(0, int(limit)))
+        report["values"] = {key: values[:shown].tolist() for key, values in columns.items()}
+        if deltas:
+            report["values"]["delta"] = {key: d[:shown].tolist() for key, d in deltas.items()}
+        if shown < count:
+            report["note"] = f"values for the first {shown} of {count} positions (limit)."
     return report
 
 
@@ -1971,6 +2552,208 @@ def _compare_volumes(
 
 
 register_handler("geometry.compare_volumes", _compare_volumes)
+
+
+###### geometry.sim_report
+
+
+_SIM_PERCENTILES = (50.0, 95.0, 99.0)
+_MATCH_BY = ("auto", "id", "name", "ptnum")
+
+
+def _sig(value: float) -> float:
+    return float(f"{value:.6g}")
+
+
+def _point_keys(geo: hou.Geometry, match_by: str) -> tuple[str, list | None]:
+    """How points are matched to rest: ('id', ids), ('name', names) or ('ptnum', None)."""
+    if match_by not in _MATCH_BY:
+        raise ValueError(f"match_by must be one of {list(_MATCH_BY)}, got {match_by!r}.")
+    if match_by in ("auto", "id") and geo.findPointAttrib("id") is not None:
+        return "id", list(geo.pointIntAttribValues("id"))
+    if match_by in ("auto", "name") and geo.findPointAttrib("name") is not None:
+        names = list(geo.pointStringAttribValues("name"))
+        # Packed RBD pieces carry a unique name per point; a name shared by
+        # many points (one per piece on unpacked geometry) cannot match.
+        if match_by == "name" or len(set(names)) == len(names):
+            return "name", names
+    if match_by in ("id", "name"):
+        raise ValueError(f"match_by='{match_by}' but the geometry has no point '{match_by}'.")
+    return "ptnum", None
+
+
+def _match_rest(keys: list | None, rest_keys: list | None, count: int, rest_count: int):
+    """(current indices, rest indices) of the points found in both (pure)."""
+    import numpy as np
+
+    if keys is None or rest_keys is None:
+        n = min(count, rest_count)
+        return np.arange(n), np.arange(n)
+    where = {key: i for i, key in enumerate(rest_keys)}
+    pairs = [(i, where[key]) for i, key in enumerate(keys) if key in where]
+    if not pairs:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    now, rest = zip(*pairs, strict=True)
+    return np.asarray(now, dtype=np.int64), np.asarray(rest, dtype=np.int64)
+
+
+def _sim_frame_metrics(
+    positions: Any,
+    *,
+    keys: list | None = None,
+    rest: tuple[Any, list | None] | None = None,
+    attribs: dict[str, Any] | None = None,
+    flags: dict[str, Any] | None = None,
+    percentiles: tuple[float, ...] | list[float] = _SIM_PERCENTILES,
+) -> dict[str, Any]:
+    """One frame's row: points, displacement from rest, attribute percentiles, flag shares (pure).
+
+    *positions* is (n, 3); *rest* is (rest positions, rest keys). An
+    attribute array of several components is measured by its length (v ->
+    speed). A flag counts elements whose value is non-zero (any component) or
+    a non-empty string. A missing attribute (None) gives None columns.
+    """
+    import numpy as np
+
+    positions = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+    row: dict[str, Any] = {"points": int(positions.shape[0])}
+    if rest is not None:
+        rest_positions = np.asarray(rest[0], dtype=np.float64).reshape(-1, 3)
+        now, then = _match_rest(keys, rest[1], positions.shape[0], rest_positions.shape[0])
+        distance = np.linalg.norm(positions[now] - rest_positions[then], axis=1)
+        for q in percentiles:
+            row[f"disp_p{q:g}"] = _sig(float(np.percentile(distance, q))) if distance.size else None
+        row["disp_max"] = _sig(float(distance.max())) if distance.size else None
+        if now.size < positions.shape[0]:
+            row["unmatched"] = int(positions.shape[0] - now.size)
+    for name, values in (attribs or {}).items():
+        label = name
+        if values is not None:
+            values = np.asarray(values, dtype=np.float64)
+            if values.ndim == 2 and values.shape[1] > 1:
+                values = np.linalg.norm(values, axis=1)
+                label = f"{name}_len"
+            values = values.ravel()
+        for q in percentiles:
+            row[f"{label}_p{q:g}"] = (
+                _sig(float(np.percentile(values, q)))
+                if values is not None and values.size
+                else None
+            )
+        row[f"{label}_max"] = (
+            _sig(float(values.max())) if values is not None and values.size else None
+        )
+    for name, values in (flags or {}).items():
+        if values is None:
+            row[f"{name}_pct"] = None
+            continue
+        if isinstance(values, list) and values and isinstance(values[0], str):
+            on = sum(1 for v in values if v)
+        else:
+            array = np.asarray(values, dtype=np.float64)
+            on = (
+                int((array.reshape(array.shape[0], -1) != 0).any(axis=1).sum()) if array.size else 0
+            )
+        total = len(values)
+        row[f"{name}_count"] = on
+        row[f"{name}_pct"] = round(100.0 * on / total, 2) if total else None
+    return row
+
+
+def _point_values(geo: hou.Geometry, name: str):
+    """A point attribute as (n, size) numbers or a list of strings, or None when missing."""
+    attrib = geo.findPointAttrib(name)
+    if attrib is None:
+        return None
+    return _attrib_column(geo, "point", attrib)[1]
+
+
+def _sim_report(
+    *,
+    node_path: str,
+    frames: list,
+    attribs: list[str] | None = None,
+    flags: list[str] | None = None,
+    rest_node: str | None = None,
+    displacement: bool = True,
+    match_by: str = "auto",
+    percentiles: list | None = None,
+) -> dict[str, Any]:
+    """A per-frame table of a simulation: count, displacement, speed percentiles, broken %.
+
+    Tuning a destruction sim by "broken %, p99 speed at f60/f160/f240" took a
+    set_frame plus a get_attrib_stats per frame and a permanent metrics
+    wrangle. Each frame is cooked in increasing order and the current frame
+    is put back. Displacement is each point's distance from its rest
+    position: *rest_node*'s points, or the first frame's, matched by id,
+    else a unique name (packed pieces), else point number.
+    """
+    if not frames:
+        raise ValueError("frames is empty: pass the frames to report, e.g. [1, 60, 120, 240].")
+    if hou.node(node_path) is None:
+        raise ValueError(f"Node not found: {node_path}")
+    quantiles = tuple(_check_percentiles(percentiles) or _SIM_PERCENTILES)
+    wanted = sorted({float(f) for f in frames})
+    attribs = [attribs] if isinstance(attribs, str) else list(attribs or [])
+    flags = [flags] if isinstance(flags, str) else list(flags or [])
+    rest: tuple[Any, list | None] | None = None
+    rest_label = None
+    if displacement and rest_node:
+        rest_geo = _get_sop_geo(rest_node)
+        _, rest_keys = _point_keys(rest_geo, match_by)
+        rest = (_point_positions(rest_geo), rest_keys)
+        rest_label = rest_node
+    current = hou.frame()
+    rows: list[dict[str, Any]] = []
+    missing: set[str] = set()
+    matched_by = None
+    try:
+        for frame in wanted:
+            hou.setFrame(frame)
+            try:
+                geo = _get_sop_geo(node_path)
+                matched_by, keys = _point_keys(geo, match_by)
+                positions = _point_positions(geo)
+                if displacement and rest is None:
+                    rest = (positions, keys)
+                    rest_label = f"frame {frame:g}"
+                values = {name: _point_values(geo, name) for name in attribs}
+                states = {name: _point_values(geo, name) for name in flags}
+                missing.update(name for name, v in {**values, **states}.items() if v is None)
+                row = _sim_frame_metrics(
+                    positions,
+                    keys=keys,
+                    rest=rest if displacement else None,
+                    attribs=values,
+                    flags=states,
+                    percentiles=quantiles,
+                )
+            except Exception as exc:
+                row = {"error": str(exc)}
+            rows.append({"frame": frame, **row})
+    finally:
+        hou.setFrame(current)
+    columns: list[str] = []
+    for row in rows:
+        columns.extend(key for key in row if key not in columns and key != "error")
+    errors = {f"{row['frame']:g}": row["error"] for row in rows if "error" in row}
+    report: dict[str, Any] = {
+        "node_path": node_path,
+        "columns": columns,
+        "rows": [[row.get(column) for column in columns] for row in rows],
+        "frame_restored": current,
+    }
+    if displacement:
+        report["rest"] = rest_label
+        report["matched_by"] = matched_by
+    if missing:
+        report["missing"] = sorted(missing)
+    if errors:
+        report["errors"] = errors
+    return report
+
+
+register_handler("geometry.sim_report", _sim_report)
 
 
 ###### geometry.set_curve_points

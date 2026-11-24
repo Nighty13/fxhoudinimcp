@@ -55,8 +55,17 @@ async def build_network(
         the parent subnet itself), flags (display/render/bypass/template),
         color [r,g,b], comment, position [x, y] (network units; the node is
         then not auto-placed, unless layout=True with auto-layout on),
-        override_expression, run_callbacks. Parms
-        are written in the order given.
+        override_expression, run_callbacks, insert_after (an existing
+        node's name: this node is wired from it when it names no inputs,
+        and every existing reader of it is moved onto this node, or onto
+        the spec named by insert_output, the end of an inserted chain;
+        answered in `inserted`). Parms are written in the order given.
+
+    VEX: every `snippet` is compiled. A dry run refuses a spec whose snippet
+    does not compile (errors prefixed "VEX:"); a build cooks each wrangle and
+    branch end the display cook did not reach (`cooked_off_display`), so
+    their errors show in `error_nodes`. A new node never lands on top of an
+    existing one; existing nodes never move.
 
     A string aimed at a numeric parameter is caught during validation and
     answered with the {"expr": ...} spelling, instead of failing mid-build
@@ -128,12 +137,17 @@ async def verify_network(ctx: Context, parent_path: str, force_cook: bool = Fals
     A node's errors are its LAST cook's verdict. A node that nothing has
     cooked since its cause was fixed is reported `stale` and listed in
     `stale_error_nodes`; pass force_cook=True to recook before judging.
-    The default cooks only the display node, so a heavy scene is left alone.
+    The default cooks only the display node, so a heavy scene is left alone;
+    wrangles and branch ends off the display chain that never cooked are
+    listed in `never_cooked` and keep `healthy` false (their VEX never
+    compiled). force_cook=True cooks them (sims, caches, ROPs excluded) and
+    every for-each block end, listed in `cooked_off_display`.
 
     Args:
         parent_path: Network to verify (e.g. "/obj/geo1").
-        force_cook: Cook the display node with force and recook every node
-            that has errors, so the verdict is about the network as it is now.
+        force_cook: Cook the display node with force, cook side branches,
+            wrangles and block ends, and recook every node that has errors,
+            so the verdict is about the whole network as it is now.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -147,7 +161,7 @@ async def get_node_card(
     node_type: str,
     context: str = "Sop",
     parm_filter: str | None = None,
-    include_help: bool | None = None,
+    include_help: bool | str | None = None,
 ) -> dict:
     """Get the authoritative documentation card for a node type, straight
     from the running Houdini: connectors in order (`inputs` / `outputs`
@@ -187,11 +201,13 @@ async def get_node_card(
         context: Category — "Sop", "Lop", "Vop" (MaterialX and other shader
             nodes inside a material network), "Dop", "Cop", "Chop", "Top",
             "Object", "Driver"; also "Cop2", "Shop", "VopNet".
-        parm_filter: Case-insensitive substring filter for the parameter list;
+        parm_filter: Case-insensitive filter for the parameter list: a substring,
+            a glob matched against the whole name or label (`qa_*`), or
             `a|b|c` matches any of the alternatives (not a regex).
-        include_help: The node's help text (about 4 KB). Default: included
-            for a whole card, left out when parm_filter asks for specific
-            parameters. Pass True or False to decide.
+        include_help: The node's help. True: its summary plus the section
+            names (`help_sections`); "full": the whole text (up to 5 KB).
+            Default: the summary for a whole card, nothing when parm_filter
+            asks for specific parameters. False: no help.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"node_type": node_type, "context": context}
@@ -203,6 +219,8 @@ async def get_node_card(
         include_help = parm_filter is None
     if not include_help:
         params["include_help"] = False
+    elif isinstance(include_help, str) and include_help.lower() == "full":
+        params["include_help"] = "full"
     return await bridge.execute("graph.get_node_card", params)
 
 
@@ -241,6 +259,7 @@ async def cook_frame_range(
     step: float = 1.0,
     attribs: list[str] | None = None,
     volumes: bool = False,
+    reset: bool = False,
 ) -> dict:
     """Cook a node frame by frame and report what changed on each frame.
 
@@ -272,6 +291,10 @@ async def cook_frame_range(
             gives it a discontinuous time step and invalid results.
         attribs: Point attributes to aggregate per frame (min/max/mean/sum).
         volumes: Also report per-volume name, resolution and value range.
+        reset: First press the Reset Simulation button of every simulation
+            the node reads (DOP networks, SOP solvers incl. RBD Bullet's
+            `resetsim`), listed in `reset_simulations`. Use after changing a
+            sim parameter: identical numbers otherwise come from a stale cache.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {
@@ -279,6 +302,8 @@ async def cook_frame_range(
         "step": step,
         "volumes": volumes,
     }
+    if reset:
+        params["reset"] = True
     if start is not None:
         params["start"] = start
     if end is not None:
