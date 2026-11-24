@@ -127,13 +127,15 @@ class TestChangeNodeType:
 
 
 class TestResolveNodeType:
-    def test_preferred_version_wins_then_exact_then_newest(self, monkeypatch):
+    def test_newest_version_wins_then_exact_then_preferred(self, monkeypatch):
         preferred = MagicMock(return_value=None)
         monkeypatch.setattr(graph.hou, "preferredNodeType", preferred)
         category = MagicMock()
         category.name.return_value = "Sop"
         category.nodeTypes.return_value = {"curve": "classic", "curve::2.0": "new"}
-        assert graph._resolve_node_type(category, "curve") == "classic"
+        # createNode("curve") builds curve::2.0 (checked on 22.0 for every
+        # versioned name): the highest version wins over the exact name.
+        assert graph._resolve_node_type(category, "curve") == "new"
         assert graph._resolve_node_type(category, "curve::2.0") == "new"
         category.nodeTypes.return_value = {"copytopoints::2.0": "v2", "copytopoints::3.0": "v3"}
         assert graph._resolve_node_type(category, "copytopoints") == "v3"

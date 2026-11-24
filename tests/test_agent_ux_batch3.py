@@ -28,6 +28,7 @@ import fxhoudinimcp_server.handlers.geometry_handlers as geometry  # noqa: E402
 import fxhoudinimcp_server.handlers.graph_handlers as graph  # noqa: E402
 import fxhoudinimcp_server.handlers.help_handlers as help_handlers  # noqa: E402
 import fxhoudinimcp_server.handlers.node_handlers as nodes  # noqa: E402
+import fxhoudinimcp_server.handlers.parameter_handlers as parameters  # noqa: E402
 import fxhoudinimcp_server.watch as watch  # noqa: E402
 
 ###### package help
@@ -172,8 +173,26 @@ class TestWatcherNoise:
         watch._on_event(_event("FlagChanged"), node=node)
         assert watch.take_changes()["nodes"] == {"/obj/house/grid": ["flags"]}
 
+    def test_a_locked_asset_is_watched_but_not_its_insides(self, monkeypatch):
+        asset = self._node("/obj/house/building")
+        asset.isLockedHDA.return_value = True
+        inner = self._node("/obj/house/building/line3")
+        asset.children.return_value = [inner]
+        watched = []
+        monkeypatch.setattr(watch, "_watch", watched.append)
+        monkeypatch.setattr(watch.hou, "node", lambda path: asset)
+        watch.end_call({"node_path": "/obj/house/building"})
+        assert inner not in watched and asset in watched
+
 
 ###### Int menus, Tab defaults, open polygons
+
+
+def test_a_radio_folder_takes_its_index_token():
+    parm = MagicMock()
+    parm.parmTemplate.return_value.type.return_value = parameters.hou.parmTemplateType.FolderSet
+    assert parameters.int_menu_value(parm, "1") == 1
+    assert parameters.int_menu_value(parm, 1) == 1
 
 
 def test_int_menu_tokens_read_the_template():

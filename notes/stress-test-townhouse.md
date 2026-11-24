@@ -73,6 +73,37 @@ Open: 6-10.
 10. Client tool schemas stay stale until the MCP server restarts (no `node=` on
     capture_screenshot, no `sweep_parameter`) - known, but cost a workaround here.
 
+## Round 2: Labs-first building (Labs Building Generator + Edge Damage)
+
+Discovery now works (`search_help("building blockout modules")` ranks the
+three Labs building tools first). The round found:
+
+11. **Type resolution disagreed with createNode** (fixed). An unversioned name
+    with an exact unversioned type (`labs::building_generator_utility`, 1.0)
+    resolved to it, while createNode builds `::2.0`: the card showed 10 of 24
+    parms and build_network validated against the wrong type.
+    `hou.preferredNodeType` is no guide (None for that Labs type, a different
+    type for rbdconcretefracture). Now: highest version wins, hidden included;
+    identical to createNode for all 281 versioned SOP/OBJ names here.
+12. **build_network refused a radio FolderSet** (fixed): "folder01 is a folder,
+    not a value", although the card lists it with its index menu. Labs'
+    utility needs it to switch to Floor Description mode.
+13. **The watcher watched inside locked assets** (fixed): naming an HDA node
+    put callbacks on its children, so Labs' internal line3 "changed".
+    `reload_plugin` did not reload `watch`, so the round-1 live check of the
+    watcher ran the old code; it now does (takes effect after one restart).
+14. **get_attrib_stats / get_geometry_info stats cannot read output 1** (open).
+    The generator's placement point cloud is its second output; every check of
+    it needed execute_python.
+15. **No warning on a polygon explosion** (open). Edge Damage at defaults took
+    the display from 557 to 4.93M polygons; the build reported success.
+16. **Labs' own help is wrong** for the generator (pattern syntax, module axes).
+    Reading the asset's inner Python through get_parameters found the truth;
+    the discipline guide now says to do that, with the conventions.
+17. execute_python that raises halfway leaves its earlier writes (a sweep left
+    a parm at a failing value). A sweep belongs in sweep_parameter, which
+    restores values; this session's client predates it.
+
 ## Guide notes worth adding
 
 - attribrandomize on a vector randomizes channels independently (pink/green

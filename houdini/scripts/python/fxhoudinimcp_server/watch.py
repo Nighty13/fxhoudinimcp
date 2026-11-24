@@ -162,8 +162,14 @@ def end_call(params: dict[str, Any]) -> None:
             node = hou.node(path)
             if node is None:
                 continue
+            if node.isInsideLockedHDA() is True:
+                continue
             _watch(node)
             _watch(node.parent())
+            # A locked asset's insides are its own business: the Labs Building
+            # Generator's line3 "changed" on every cook it did.
+            if node.isLockedHDA() is True:
+                continue
             for child in list(node.children())[:_CHILDREN_PER_NETWORK]:
                 _watch(child)
 

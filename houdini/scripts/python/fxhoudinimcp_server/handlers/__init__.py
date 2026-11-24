@@ -77,7 +77,7 @@ if _failed:
 # then the rest: a module that did `from x import f` keeps the old f unless
 # x was reloaded before it. The dispatcher is never reloaded, since it holds
 # the registry the reloaded modules register into.
-_HELPER_MODULES = ["errors", "serialize", "config", "ui", "outputs"]
+_HELPER_MODULES = ["errors", "serialize", "config", "ui", "outputs", "menus", "watch"]
 # dop_handlers first: node, parameter and graph handlers import dop_cache_note.
 _IMPORTED_FROM = ["dop_handlers", "node_handlers", "parameter_handlers", "viewport_handlers"]
 

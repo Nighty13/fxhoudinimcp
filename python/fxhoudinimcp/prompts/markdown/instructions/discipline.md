@@ -195,6 +195,9 @@ the alias so old scenes load, but prefer the current name:
 *   To show the user where their controls are, `set_selection([node])` and then `capture_screenshot(pane_name=<the Parameter pane's name>)`; that image is the proof, not a description of the interface.
 *   HDA values the user tunes on an instance are not the definition's defaults, and Houdini Engine cooks the defaults. Promote tuned values into the definition before calling a game-engine asset done (`get_workflow_guide("game_assets")`).
 
+*   AN ASSET'S HELP CAN BE WRONG; ITS CODE IS NOT. When a Labs or studio HDA ignores what its help says, read the script that consumes the parm: `get_parameters("<asset>/<inner python or wrangle>", patterns=["python"])` (or `["snippet"]`) works inside a locked asset. Labs Building Generator 4.0's help shows `<A-B>` facade patterns, but its code splits the plain string on `-` (`wall-window`), takes `name*` as name plus a random suffix from that module's variations, and places modules authored with their width along Z, facing +X, base at y=0. Its Floor Descriptions belong to Building from Patterns, not the generator.
+*   VOXEL-BASED LABS TOOLS DEFAULT TO FINE RESOLUTION. Edge Damage at its 0.01 voxel size turned 557 polygons into 4.9 million. Set the voxel size from the piece's size first (5 cm on a 2 m wall gave about 10k per module), and apply damage to a module once, before it is instanced, never to the generated building.
+
 ## WORKFLOW GUIDES — `get_workflow_guide(topic)` before designing a setup you have not built before
 
 This server ships a written guide per subject, each one distilled from that

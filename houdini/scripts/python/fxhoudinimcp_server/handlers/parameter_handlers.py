@@ -3027,8 +3027,12 @@ def int_menu_value(parm: hou.Parm, value: Any) -> Any:
     """
     if isinstance(value, str):
         with contextlib.suppress(Exception):
-            if parm.parmTemplate().type() == hou.parmTemplateType.Int:
+            kind = parm.parmTemplate().type()
+            if kind == hou.parmTemplateType.Int:
                 return _menu_index(parm, value)
+            if kind == hou.parmTemplateType.FolderSet and value.strip().isdigit():
+                # A radio folder's tokens are its indices, "0", "1", ...
+                return int(value)
     return value
 
 

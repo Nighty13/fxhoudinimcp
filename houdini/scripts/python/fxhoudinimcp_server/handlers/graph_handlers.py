@@ -84,23 +84,32 @@ _MULTIPARM_FOLDERS = tuple(
 def _resolve_node_type(category: hou.NodeTypeCategory, type_name: str):
     """Resolve *type_name* in *category* the way createNode would.
 
-    hou.preferredNodeType maps an unversioned name to the version that
-    createNode actually instantiates (e.g. copytopoints -> ::2.0).
+    createNode builds the highest version of a name, hidden versions included:
+    "labs::building_generator_utility" builds ::2.0 although an unversioned
+    1.0 type of that exact name exists, and "copytopoints" builds ::2.0.
+    Returning the exact name validated a spec against 1.0's 10 parms while
+    ::2.0's 24 were built, and the card described the wrong node.
+    hou.preferredNodeType is no guide: it answers None for that Labs type and
+    a different type for rbdconcretefracture. Checked against createNode for
+    all 281 versioned SOP and OBJ names of a 22.0 install with Labs: identical.
+    It is kept as a last resort for a name with no type of its own.
     """
+    types = category.nodeTypes()
+    from fxhoudinimcp_server.handlers.hda_handlers import _version_key
+
+    prefix = type_name + "::"
+    versioned = [
+        key for key in types if key.startswith(prefix) and key[len(prefix) :][:1].isdigit()
+    ]
+    if versioned:
+        # Numeric order, not string order: ::10.0 is newer than ::2.0.
+        return types[max(versioned, key=lambda key: _version_key(key[len(prefix) :]))]
+    if type_name in types:
+        return types[type_name]
     with contextlib.suppress(Exception):
         preferred = hou.preferredNodeType(f"{category.name()}/{type_name}")
         if preferred is not None:
             return preferred
-    types = category.nodeTypes()
-    if type_name in types:
-        return types[type_name]
-    from fxhoudinimcp_server.handlers.hda_handlers import _version_key
-
-    prefix = type_name + "::"
-    versioned = [key for key in types if key.startswith(prefix)]
-    if versioned:
-        # Numeric order, not string order: ::10.0 is newer than ::2.0.
-        return types[max(versioned, key=lambda key: _version_key(key[len(prefix) :]))]
     return None
 
 
@@ -1628,6 +1637,17 @@ def build_network(
             # rbdmaterialfracture) took an expression and did nothing; the
             # count the caller meant lives in a parm inside it.
             for parm_name in sorted(set(spec.get("parms") or {}) | set(_spec_expressions(spec))):
+                written = (spec.get("parms") or {}).get(parm_name)
+                if (
+                    templates.get(parm_name) == "FolderSet"
+                    and parm_name not in _spec_expressions(spec)
+                    and _expression_value(written) is None
+                ):
+                    # A radio folder set is a value: its index picks which
+                    # folder's parms apply (the Labs Building Generator
+                    # Utility's Building Module / Floor Description switch).
+                    # The card lists it with its index menu, so it is written.
+                    continue
                 if templates.get(parm_name) in ("Folder", "FolderSet"):
                     inside = (
                         sorted(
