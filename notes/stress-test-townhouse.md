@@ -106,6 +106,39 @@ three Labs building tools first). The round found:
     a parm at a failing value). A sweep belongs in sweep_parameter, which
     restores values; this session's client predates it.
 
+## Round 3: terrain, lake, road tool with barriers
+
+Built `ste::terrain_road` (HoudiniProjects/terrain_road): heightfield terrain,
+a lake blended into the low corner, and a road between two picked points
+(parms, or the first/last point of a curve wired into input 1). The path is
+Find Shortest Path on a draped 6 m triangle grid with a Custom Edge Cost of
+length x (grade / max grade)^4, turning costs, and the lake forbidden; the
+profile is clamped to the max grade (cut/fill), stamped into the height layer
+with an embankment band, and guard rails go where the drop 6 m out exceeds a
+threshold. Measured: grade median 8.0%, p99 8.4% (target 8%); road-to-ground
+gap +-0.2 m except the dead-end cut; 17 rail runs; full cook 649 ms, of which
+the path search is 246 ms.
+
+Findings:
+
+18. **open_polygons note fired on every legitimate curve** (fixed: only when
+    open and closed polygons are mixed).
+19. **Measure's attribute name follows its type only through a UI callback**:
+    measure=perimeter still wrote `area`, and a blast on `@perimeter` matched
+    nothing (no error). Same class as the res_mode trap; build_network could
+    run callbacks for menus whose callback renames an output (open).
+20. **find_expensive_nodes on an object holding an HDA ranks nothing**
+    (`top_nodes: []`); it has to be pointed inside the asset (open).
+21. **insert_after cannot chain in one build** (#7 again, still open).
+22. **create_wrangle does not wire inputs**: the wrangle came back unconnected
+    and needed a connect_nodes_batch (open; it takes no `inputs`).
+23. The watcher reported real edits correctly twice this round (the user moved
+    display flags in the subnet while I built); no false positives seen.
+24. Grade realism needs cut/fill: the cheapest path on a 160 m relief has no
+    route under 8% that follows the ground, whatever the edge cost; the
+    profile clamp is what makes the grade. Large fills (up to 50 m) show where
+    a bridge belongs: a bridge/tunnel pass is the natural next feature.
+
 ## Guide notes worth adding
 
 - attribrandomize on a vector randomizes channels independently (pink/green

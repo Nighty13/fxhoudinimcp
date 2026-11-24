@@ -252,7 +252,10 @@ def _get_geometry_info(*, node_path: str, output_index: int = 0, **_: Any) -> di
     }
     if open_count := open_polygon_count(geo):
         result["open_polygons"] = open_count
-        result["open_polygons_note"] = OPEN_POLYGONS_NOTE
+        # A road path or a rail run is all curves on purpose; the note is for
+        # surfaces that came out partly as wires (closed and open mixed).
+        if prim_types.get("Polygon", 0) > open_count:
+            result["open_polygons_note"] = OPEN_POLYGONS_NOTE
     warnings = list(cook_warnings)
     warning = update_mode_warning()
     if warning:
