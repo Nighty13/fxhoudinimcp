@@ -92,10 +92,12 @@ three Labs building tools first). The round found:
     put callbacks on its children, so Labs' internal line3 "changed".
     `reload_plugin` did not reload `watch`, so the round-1 live check of the
     watcher ran the old code; it now does (takes effect after one restart).
-14. **get_attrib_stats / get_geometry_info stats cannot read output 1** (open).
+14. **get_attrib_stats cannot read output 1** (fixed: `output_index`).
     The generator's placement point cloud is its second output; every check of
     it needed execute_python.
-15. **No warning on a polygon explosion** (open). Edge Damage at defaults took
+15. **No warning on a polygon explosion** (fixed: build_network and verify_network
+    report `heavy_nodes` (100k+ prims at 100x their input) and a `heavy_note`
+    past 1M display prims; nothing is cooked to find them). Edge Damage at defaults took
     the display from 557 to 4.93M polygons; the build reported success.
 16. **Labs' own help is wrong** for the generator (pattern syntax, module axes).
     Reading the asset's inner Python through get_parameters found the truth;

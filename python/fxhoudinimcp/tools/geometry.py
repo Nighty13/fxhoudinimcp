@@ -384,6 +384,7 @@ async def get_attrib_stats(
     reduce: list[str] | None = None,
     max_groups: int | None = None,
     list_if_count_below: int | None = None,
+    output_index: int = 0,
 ) -> dict:
     """Aggregate statistics for numeric attributes: min, max, mean, sum.
 
@@ -434,6 +435,9 @@ async def get_attrib_stats(
             this many (cap 500), also list them as `elements`: index and the
             values of attribs. Three waterfall points come back as three
             positions instead of a mean.
+        output_index: Which output to read, for nodes with several (Labs
+            Building Generator's module placement is output 1): 0 is the
+            first.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"attrib_class": attrib_class}
@@ -453,6 +457,8 @@ async def get_attrib_stats(
     ):
         if value is not None:
             params[key] = value
+    if output_index:
+        params["output_index"] = output_index
     for key, value in (
         ("node_path", node_path),
         ("attribs", attribs),

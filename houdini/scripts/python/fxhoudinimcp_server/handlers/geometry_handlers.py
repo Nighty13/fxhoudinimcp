@@ -219,7 +219,7 @@ def _get_geometry_info(*, node_path: str, output_index: int = 0, **_: Any) -> di
     """Return summary information about a SOP node's geometry."""
     node = hou.node(node_path)
     cook_state, cook_warnings = _cook_state(node) if node is not None else ({}, [])
-    geo = _get_sop_geo(node_path, output_index)
+    geo = _get_sop_geo(node_path, output_index) if output_index else _get_sop_geo(node_path)
 
     # Attribute lists per class
     attribs: dict[str, list[dict]] = {}
@@ -1153,6 +1153,7 @@ def _get_attrib_stats(
     reduce: list[str] | None = None,
     max_groups: int | None = None,
     list_if_count_below: int | None = None,
+    output_index: int = 0,
 ) -> dict[str, Any]:
     """The statistics below, for one node now, or for several nodes over several frames.
 
@@ -1173,6 +1174,10 @@ def _get_attrib_stats(
     per row" is group_by="s", attribs=["uv"], the `spread` of uv.x. And
     *list_if_count_below* lists the elements themselves when there are that
     few of them: three waterfall points are three positions, not a mean.
+
+    *output_index* reads a node's second or third output: the Labs Building
+    Generator puts its module placement on output 1, and every check of it
+    needed execute_python.
     """
     if node_path is not None and node_paths:
         # node_paths used to win and node_path was dropped without a word.
@@ -1199,6 +1204,8 @@ def _get_attrib_stats(
         )
         if value or (key == "list_if_count_below" and value is not None)
     }
+    if output_index:
+        narrowing["output_index"] = int(output_index)
     if (buckets or bucket_size or reduce) and not group_by:
         raise ValueError("buckets, bucket_size and reduce go with group_by=<attribute>.")
     if frames is None and node_paths is None:
@@ -1259,6 +1266,7 @@ def _attrib_stats_once(
     reduce: list[str] | None = None,
     max_groups: int | None = None,
     list_if_count_below: int | None = None,
+    output_index: int = 0,
 ) -> dict[str, Any]:
     """Aggregate statistics for numeric attributes: min, max, mean, sum.
 
@@ -1267,7 +1275,7 @@ def _attrib_stats_once(
     simulation is doing something needs the aggregate, not the values, and that
     is otherwise only reachable through execute_python.
     """
-    geo = _get_sop_geo(node_path)
+    geo = _get_sop_geo(node_path, output_index) if output_index else _get_sop_geo(node_path)
 
     cls = _attrib_class_key(attrib_class)
     listers = {

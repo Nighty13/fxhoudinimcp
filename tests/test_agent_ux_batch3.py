@@ -264,3 +264,50 @@ def test_verify_lists_only_nodes_with_something_to_report(monkeypatch):
     assert result["clean_nodes"] == 1
     full = graph.verify_network("/obj/g", all_nodes=True)
     assert len(full["nodes"]) == 2 and "clean_nodes" not in full
+
+
+###### heavy geometry, stats on a second output
+
+
+def _sop(path, prims, inputs=()):
+    node = MagicMock()
+    node.path.return_value = path
+    node.type.return_value.category.return_value.name.return_value = "Sop"
+    node.needsToCook.return_value = False
+    node.geometry.return_value.intrinsicValue.return_value = prims
+    node.inputs.return_value = list(inputs)
+    return node
+
+
+def test_a_node_that_multiplies_its_input_is_named():
+    module = _sop("/obj/b/wall_geo", 6)
+    damage = _sop("/obj/b/wall_damage", 240_000, [module])
+    report = graph.heavy_geometry([module, damage], {"prims": 4_933_741})
+    assert report["heavy_nodes"] == [
+        {"path": "/obj/b/wall_damage", "prims": 240_000, "largest_input_prims": 6}
+    ]
+    assert "4,933,741" in report["heavy_note"]
+
+
+def test_light_or_proportional_geometry_says_nothing():
+    grid = _sop("/obj/t/grid", 200_000)
+    noise = _sop("/obj/t/noise", 200_000, [grid])
+    assert graph.heavy_geometry([grid, noise], {"prims": 200_000}) is None
+
+
+def test_a_node_that_would_have_to_cook_is_not_cooked():
+    node = _sop("/obj/b/x", 10**7)
+    node.needsToCook.return_value = True
+    assert graph.heavy_geometry([node], {"prims": 10}) is None
+    node.geometry.assert_not_called()
+
+
+def test_attrib_stats_reads_the_output_it_is_asked_for(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        geometry, "_attrib_stats_once", lambda path, *a, **kw: seen.append(kw) or {"ok": True}
+    )
+    geometry._get_attrib_stats(node_path="/obj/b/building", output_index=1)
+    assert seen[-1]["output_index"] == 1
+    geometry._get_attrib_stats(node_path="/obj/b/building")
+    assert "output_index" not in seen[-1]

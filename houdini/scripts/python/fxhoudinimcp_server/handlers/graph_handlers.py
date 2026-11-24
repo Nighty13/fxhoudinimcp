@@ -81,6 +81,58 @@ _MULTIPARM_FOLDERS = tuple(
 )
 
 
+_HEAVY_DISPLAY_PRIMS = 1_000_000
+_HEAVY_NODE_PRIMS = 100_000
+_HEAVY_GROWTH = 100
+
+
+def _cooked_prim_count(node) -> int | None:
+    """Primitives on a SOP's output if it has cooked; None if it would have to cook."""
+    with contextlib.suppress(Exception):
+        if node.type().category().name() != "Sop" or node.needsToCook():
+            return None
+        return int(node.geometry().intrinsicValue("primitivecount"))
+    return None
+
+
+def heavy_geometry(nodes: list, evidence: dict | None) -> dict | None:
+    """Name the nodes that multiplied the geometry, when the result got heavy.
+
+    Labs Edge Damage at its default 1 cm voxels turned 557 polygons into
+    4.93 million and the build reported success: the count sat in `geometry`
+    without a word. A node whose output is at least 100k primitives and 100x
+    its largest input is named, and a display over 1M primitives gets a note.
+    Only nodes that already cooked are read; nothing is cooked for this.
+    """
+    rows = []
+    for node in nodes:
+        prims = _cooked_prim_count(node)
+        if not isinstance(prims, int) or prims < _HEAVY_NODE_PRIMS:
+            continue
+        inputs = [_cooked_prim_count(source) for source in node.inputs() if source is not None]
+        counted = [count for count in inputs if isinstance(count, int)]
+        if not counted:
+            continue  # a generator makes geometry, it does not multiply it
+        largest = max(counted)
+        if prims >= _HEAVY_GROWTH * max(largest, 1):
+            rows.append({"path": node.path(), "prims": prims, "largest_input_prims": largest})
+    total = (evidence or {}).get("prims") if isinstance(evidence, dict) else 0
+    if not isinstance(total, int) or isinstance(total, bool):
+        total = 0
+    if not rows and total < _HEAVY_DISPLAY_PRIMS:
+        return None
+    report: dict = {"heavy_nodes": rows}
+    report["heavy_note"] = (
+        f"{total:,} primitives on the display node. " if total >= _HEAVY_DISPLAY_PRIMS else ""
+    ) + (
+        "The nodes in heavy_nodes multiply their input by 100x or more: check their "
+        "resolution (voxel size, divisions, subdivision) before going on."
+        if rows
+        else "Check which node made it before going on; draft resolution first."
+    )
+    return report
+
+
 def _resolve_node_type(category: hou.NodeTypeCategory, type_name: str):
     """Resolve *type_name* in *category* the way createNode would.
 
@@ -2070,6 +2122,7 @@ def build_network(
         # the library now authors (its Material prims), not null.
         with contextlib.suppress(Exception):
             evidence = {"stage_of": parent.path(), **_stage_summary(parent)}
+    heavy = heavy_geometry(list(created.values()), evidence)
     result = {
         "success": True,
         "valid": True,
@@ -2081,6 +2134,8 @@ def build_network(
     }
     if side_cooked:
         result["cooked_off_display"] = side_cooked
+    if heavy:
+        result.update(heavy)
     if inserted:
         result["inserted"] = inserted
     if flags_not_applied:
@@ -2430,6 +2485,8 @@ def verify_network(
         "force_cook": bool(force_cook),
         "nodes": reports if all_nodes else [r for r in reports if set(r) - {"path", "type"}],
     }
+    if heavy := heavy_geometry(children, result["geometry"]):
+        result.update(heavy)
     if not all_nodes:
         # 194 rows of {path, type} said nothing a count does not; the nodes
         # with something to report (errors, warnings, flags) are what an
