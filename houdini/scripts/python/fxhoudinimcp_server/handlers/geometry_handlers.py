@@ -2205,10 +2205,15 @@ def _compact_volume_table(entries: list[dict[str, Any]]) -> dict[str, Any]:
     columns = ["name", "res", "bbox_min", "bbox_max", "voxel", "min", "max", "mean"]
     read = any("voxel_stats" in entry for entry in entries)
     split = any("threshold" in entry.get("voxel_stats", {}) for entry in entries)
+    binned = any("histogram" in entry.get("voxel_stats", {}) for entry in entries)
     if read:
         columns += ["p50", "p95"]
     if split:
         columns.append("share_above")
+    if binned:
+        # Counts only: the edges are the bins asked for, or equal steps from
+        # the row's min to max when a bin count was given.
+        columns.append("hist")
     rows = []
     for entry in entries:
         voxel = entry.get("voxel_size")
@@ -2230,6 +2235,8 @@ def _compact_volume_table(entries: list[dict[str, Any]]) -> dict[str, Any]:
             row += [_short(quantiles.get("50")), _short(quantiles.get("95"))]
         if split:
             row.append(stats.get("threshold", {}).get("share_above"))
+        if binned:
+            row.append([b["count"] for b in stats.get("histogram", [])])
         rows.append(row)
     return {"columns": columns, "rows": rows}
 

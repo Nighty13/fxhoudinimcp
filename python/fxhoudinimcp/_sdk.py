@@ -145,6 +145,32 @@ def unknown_argument_message(tool: str, unknown: list[str], accepted: set[str]) 
     return f"{tool} does not take {', '.join(parts)}. Accepted arguments: {ordered}."
 
 
+# The same thing is spelled differently across tools (create_wrangle's
+# vex_code, validate_vex's code, a wrangle's own snippet parm). A caller using
+# the other tool's spelling meant the same argument; it is renamed rather than
+# refused, but only when the tool declares exactly one of the candidates and the
+# caller did not also pass it.
+ARG_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "code": ("vex_code",),
+    "vex_code": ("code",),
+    "snippet": ("vex_code", "code"),
+    "node": ("node_path",),
+    "path": ("node_path",),
+}
+
+
+def apply_synonyms(data: dict, accepted: set[str]) -> dict:
+    """Rename arguments given under a known synonym of an accepted one."""
+    renamed = dict(data)
+    for key in list(data):
+        if key in accepted:
+            continue
+        targets = [t for t in ARG_SYNONYMS.get(key, ()) if t in accepted and t not in renamed]
+        if len(targets) == 1:
+            renamed[targets[0]] = renamed.pop(key)
+    return renamed
+
+
 def forbid_unknown_arguments(server, name: str) -> None:
     """Make tool ``name`` refuse arguments it does not declare.
 
@@ -168,6 +194,7 @@ def forbid_unknown_arguments(server, name: str) -> None:
 
     def refuse_unknown(cls, data):
         if isinstance(data, dict):
+            data = apply_synonyms(data, accepted)
             unknown = sorted(key for key in data if key not in accepted)
             if unknown:
                 raise ValueError(unknown_argument_message(name, unknown, accepted))

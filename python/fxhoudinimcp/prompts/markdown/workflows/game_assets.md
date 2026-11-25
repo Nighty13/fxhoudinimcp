@@ -15,6 +15,28 @@ game-engine checklist on top of it. Houdini Engine for Unreal ships with Houdini
 - **FBX** when the asset is final, or the team has no Houdini Engine seats.
   Export with a normal FBX ROP (`filmboxfbx` in /out, or `rop_fbx` inside SOPs).
 - Do both from the same SOP output, so they cannot drift apart.
+- **Driving Unreal**: fxhoudinimcp's `start_unreal` / `unreal_status` /
+  `unreal_python` (any editor Python) / `unreal_call` (Epic's Unreal MCP toolsets,
+  including `HoudiniEngineTools`) / `unreal_capture`. Prepare a project once with
+  `extras/unreal/setup_unreal_project.py`; tested Unreal-side scripts live in
+  `extras/unreal/recipes/` (test level with fixed exposure, landscape layer and
+  flowmap water materials, texture and FBX character import). Never
+  `UnrealEditor -ExecutePythonScript` for Houdini Engine work: the editor quits
+  before the asynchronous cook.
+- **After re-importing a changed HDA**: `restart_houdini_session` (a live session
+  holding the old definition crashed HARS on the next spawn), then
+  `recook_hda(rebuild=True)` on placed actors (until then they keep the old
+  parameter interface). Proxy meshes carry no vertex colours: `refine_hda` before
+  judging the look. Colour from `Cd` needs a material that reads Vertex Color
+  (`/HoudiniEngineToolset/Materials/M_HoudiniVertexColor`) through `unreal_material`.
+- **Characters go by FBX**, not Houdini Engine: KineFX skeleton + capture +
+  animated pose into `kinefx::rop_fbxcharacteroutput`. The skin needs a primitive
+  `name` (or `path`) attribute, or the export fails ("Both name and path primitive
+  attributes are missing"). Verified: 81-joint octopus, 60 frames, arrives as
+  SkeletalMesh + Skeleton + AnimSequence (`recipes/assets.py: import_fbx_character`).
+- **Foliage**: `unreal_instance` points become instanced static meshes; add point
+  int `unreal_foliage` = 1 and they land in the level's InstancedFoliageActor
+  instead (editable with the Foliage tool), replaced on every recook.
 
 ## HDA interface rules for Houdini Engine
 

@@ -408,16 +408,22 @@ async def set_current_network(
 async def find_error_nodes(
     ctx: Context,
     root_path: str = "/",
+    include_locked_assets: bool = False,
 ) -> dict:
     """Find all nodes with errors or warnings in the scene.
 
+    Locked assets are not entered by default (`locked_assets_not_entered`
+    counts them): stock heightfield nodes' internals report errors that are
+    not the scene's, and a real one shows on the asset node itself.
+
     Args:
         root_path: Root node path to search from.
+        include_locked_assets: Also scan inside locked HDAs.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
         "viewport.find_error_nodes",
-        {"root_path": root_path},
+        {"root_path": root_path, "include_locked_assets": include_locked_assets},
     )
 
 

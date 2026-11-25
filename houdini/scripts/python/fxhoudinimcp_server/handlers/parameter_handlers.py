@@ -1970,13 +1970,26 @@ def _create_spare_parameters(
 
     node.setParmTemplateGroup(ptg)
 
-    return {
+    result: dict[str, Any] = {
         "node_path": node_path,
         "created": created,
         "updated": updated,
         "count": len(created) + len(updated),
         "folder_name": folder_name,
     }
+    # A wrangle compiled before its ch() parms existed keeps reading 0 from
+    # them: neither a value change nor a forced cook recompiles it, writing
+    # the snippet again does.
+    snippet = node.parm("snippet")
+    if (
+        created
+        and snippet is not None
+        and snippet.parmTemplate().type() == hou.parmTemplateType.String
+    ):
+        with contextlib.suppress(hou.OperationFailed, hou.PermissionError):
+            snippet.set(snippet.unexpandedString())
+            result["vex_recompiled"] = True
+    return result
 
 
 register_handler("parameters.create_spare_parameters", _create_spare_parameters)

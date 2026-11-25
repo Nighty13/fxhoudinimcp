@@ -2355,11 +2355,16 @@ def set_current_network(network_path: str, other_objects: str | None = "hide") -
 _ERROR_NODE_CAP = 50
 
 
-def find_error_nodes(root_path: str = "/") -> dict:
+def find_error_nodes(root_path: str = "/", include_locked_assets: bool = False) -> dict:
     """Find all nodes with errors or warnings, recursively from a root path.
+
+    Locked assets are not entered unless include_locked_assets: their
+    internals (stock heightfield nodes' unused for-each blocks) report errors
+    that are not the scene's, and a real one shows on the asset node itself.
 
     Args:
         root_path: Root node path to start searching from. Defaults to '/'.
+        include_locked_assets: Also scan inside locked HDAs.
     """
     root = hou.node(root_path)
     if root is None:
@@ -2369,7 +2374,7 @@ def find_error_nodes(root_path: str = "/") -> dict:
 
     error_nodes = []
     warning_nodes = []
-    counts = {"errors": 0, "warnings": 0}
+    counts = {"errors": 0, "warnings": 0, "locked_assets_skipped": 0}
 
     def _check_node(node):
         """Recursively check nodes for errors and warnings.
@@ -2398,7 +2403,15 @@ def find_error_nodes(root_path: str = "/") -> dict:
                         }
                     )
 
-        # Recurse into children
+        if not include_locked_assets and node is not root:
+            try:
+                locked = node.isLockedHDA()
+            except (hou.OperationFailed, hou.ObjectWasDeleted, AttributeError):
+                locked = False
+            if locked:
+                counts["locked_assets_skipped"] += 1
+                return
+
         try:
             for child in node.children():
                 _check_node(child)
@@ -2412,6 +2425,7 @@ def find_error_nodes(root_path: str = "/") -> dict:
         "warning_nodes": warning_nodes,
         "error_count": counts["errors"],
         "warning_count": counts["warnings"],
+        "locked_assets_not_entered": counts["locked_assets_skipped"],
         "root_path": root_path,
     }
 

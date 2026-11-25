@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1",
+	"FriendlyName": "Houdini Engine Toolset",
+	"Description": "AI toolset for Epic's Unreal MCP (ModelContextProtocol): import Houdini Digital Assets, place them, read and set their parameters, recook and bake. Python only, nothing to compile.",
+	"Category": "Procedural",
+	"CreatedBy": "STE Falcon Software",
+	"EditorOnly": true,
+	"CanContainContent": true,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Plugins": [
+		{ "Name": "PythonScriptPlugin", "Enabled": true },
+		{ "Name": "ToolsetRegistry", "Enabled": true },
+		{ "Name": "HoudiniEngine", "Enabled": true }
+	]
+}

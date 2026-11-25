@@ -1,6 +1,6 @@
 # :material-wrench: Tools
 
-fxhoudinimcp exposes **221 tools** across **24 categories**. The [Technical](../technical/tools/index.md) section documents each one.
+fxhoudinimcp exposes **231 tools** across **25 categories**. The [Technical](../technical/tools/index.md) section documents each one.
 
 --8<-- "README.md:features"
 

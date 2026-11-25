@@ -64,6 +64,35 @@ See the README's *Installation → Troubleshooting* if the MCP menu is missing.
 
 ## 3. Unreal Engine project setup
 
+**One command (recommended):**
+
+```powershell
+python extras/unreal/setup_unreal_project.py D:/path/MyProject/MyProject.uproject
+claude mcp add --transport http --scope user unreal http://127.0.0.1:8000/mcp
+```
+
+The script copies SideFX's prebuilt Houdini Engine plugin (after checking its BuildId matches the engine) and
+this repo's `extras/unreal/HoudiniEngineToolset` into `<Project>/Plugins/`. It enables Houdini Engine, Python,
+Epic's **Unreal MCP** (`ModelContextProtocol`, experimental in 5.8) and `EditorToolset`. It also turns on Python
+remote execution and auto-starts the MCP server on port 8000. Backups are kept as `*.bak_setup`. Open the
+project once and the agent gets Epic's toolsets (viewport capture, logs, actors, assets, PCG...) plus
+`HoudiniEngineTools`: `import_hda`, `spawn_hda`, `list_hda_actors`, `get_hda_parameters`, `set_hda_parameters`,
+`recook_hda`, `get_hda_status`, `get_hda_inputs`, `set_hda_curve_input`, `set_hda_object_input`, `refine_hda`, `restart_houdini_session`, `frame_hda`, `bake_hda`. Anything else is plain editor Python: `unreal_python` (fxhoudinimcp) or `ue_exec.py`, with reusable scripts in `extras/unreal/recipes/`.
+Unreal MCP exposes three tools (`list_toolsets`, `describe_toolset`, `call_tool`); toolset names are the full
+Python path, e.g. `houdini_engine_toolset.toolset.HoudiniEngineTools`.
+`extras/unreal/ue_mcp_call.py` calls it from scripts; `ue_exec.py` (below) stays the escape hatch for anything
+no tool covers, and also hot-reloads the toolset after an edit (re-import the module, unregister, register).
+
+Gotchas found on the way:
+- An HDA with an optional curve input receives a default 2-point spline from Houdini Engine; guard the
+  input (`npoints(...) >= 3`) or the asset builds from that line.
+- `CaptureViewport` needs `captureTransform` and `annotations` even though it calls them optional
+  (`frame_hda` returns a ready `captureTransform`).
+- Houdini Engine's default material ignores the HDA's `Cd`; colours need an `unreal_material` with a Vertex Color node.
+- From Git Bash, `/Game/...` arguments get rewritten to `C:/Program Files/Git/Game/...`: set `MSYS_NO_PATHCONV=1`.
+
+**By hand:**
+
 1. **Plugins** (copy into `<Project>/Plugins/`, then enable them in the `.uproject`):
    - `HoudiniEngine`: from `C:/Program Files/Side Effects Software/Houdini Engine/Unreal/22.0.508/5.8/`.
    - `SideFX_Labs`: from `.../sidefx_packages/SideFXLabs22.0/unreal/5.8/SideFX_Labs`. Copy only the main plugin

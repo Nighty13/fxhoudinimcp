@@ -111,6 +111,25 @@ designer's point spacing).
   it returns False silently.
 - Show the user where the controls are: `set_selection([hda])`, then
   `capture_screenshot(pane_name=<the Parameter pane>)`.
+- **An optional curve input is never empty in Unreal**: Houdini Engine gives it a
+  default 2-point, 2 m spline. Switch to the input only when it is a real curve
+  (`(bbox(opinputpath('..',0), D_XSIZE) + bbox(..., D_ZSIZE)) > 20`, or
+  `npoints >= 3` for a closed shape), or the asset builds from that stub.
+- **`volumesample()` on a heightfield samples a flat volume at y = 0.** Sampling a
+  mask at a scattered point's own `@P` (y = terrain height) reads the border
+  value, so a "keep clear of the river" cull silently removes nothing. Sample
+  `set(@P.x, 0, @P.z)`.
+- **Edit layers**: `unreal_landscape_editlayer_name` (prim string) names the layer
+  a generated landscape writes. A second HDA writes its own layer onto it in
+  modify mode: `unreal_landscape_output_mode` 1, `unreal_landscape_editlayer_type`
+  1 (additive: the volume holds the *change*, not the terrain), and the landscape
+  fed into input 0 through a **World** input (a Geometry input refuses actors).
+  Verified in UE 5.8.4 / HE 3.0: the layer appears, toggles off non-destructively.
+- **Do not put `unreal_landscape_editlayer_clear` on a generating landscape**: with
+  it, HE 3.0 regenerated paint layers but left the heights flat (z range 0). On a
+  modify-mode layer it is what you want.
+- Rebuilding the generating asset (after a re-import) recreates its landscape, and
+  layers other HDAs wrote onto the old one are gone: recook those afterwards.
 
 ## Unreal-side notes (from UE 5.8 sessions, not checkable from Houdini)
 

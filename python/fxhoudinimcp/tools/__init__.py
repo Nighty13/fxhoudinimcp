@@ -29,6 +29,7 @@ from fxhoudinimcp.tools import (
     shelf,  # noqa: F401
     takes,  # noqa: F401
     tops,  # noqa: F401
+    unreal,  # noqa: F401
     vex,  # noqa: F401
     viewport,  # noqa: F401
     workflows,  # noqa: F401
