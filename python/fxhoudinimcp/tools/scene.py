@@ -19,6 +19,33 @@ from fxhoudinimcp.node_versions import sampled_series, staleness_warning
 from fxhoudinimcp.server import _get_bridge, mcp
 
 
+def install_dir_hip_warning(hip_file: str | None) -> str | None:
+    """A warning when the open scene sits inside Houdini's install folder.
+
+    A fresh GUI session's untitled.hip lives in $HFS/bin, so $HIP-relative
+    caches, renders and a bare save_scene() would write into Program Files.
+    """
+    if not hip_file:
+        return None
+    path = hip_file.replace("\\", "/").lower()
+    if "/side effects software/" in path or path.endswith("/bin/untitled.hip"):
+        return (
+            f"The open scene ({hip_file}) is inside Houdini's install folder, so $HIP-relative "
+            "caches and renders and a save_scene() without a path would go there. Call "
+            "new_project(name) (or open_project) before building."
+        )
+    return None
+
+
+def _with_hip_warning(result: Any) -> Any:
+    """Add hip_warning to a scene reply whose hip file sits in Houdini's install folder."""
+    if isinstance(result, dict):
+        warning = install_dir_hip_warning(result.get("hip_file"))
+        if warning:
+            result["hip_warning"] = warning
+    return result
+
+
 @mcp.tool()
 async def get_houdini_connection_status(ctx: Context) -> dict:
     """Check the MCP-to-Houdini bridge without raising on disconnect.
@@ -79,6 +106,9 @@ async def get_houdini_connection_status(ctx: Context) -> dict:
         "health": health,
         "sessions": sessions,
     }
+    hip_warning = install_dir_hip_warning(health.get("hip_file"))
+    if hip_warning:
+        payload["hip_warning"] = hip_warning
 
     # Advisory only: tells the assistant when the version markers in the
     # instructions were never checked against this Houdini, so it knows to
@@ -122,7 +152,9 @@ async def new_scene(ctx: Context, save_current: bool = False) -> dict:
         save_current: Save the current scene before clearing.
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute("scene.new_scene", {"save_current": save_current})
+    return _with_hip_warning(
+        await bridge.execute("scene.new_scene", {"save_current": save_current})
+    )
 
 
 @mcp.tool()
@@ -177,7 +209,7 @@ async def load_scene(
         payload["node_paths"] = node_paths
     if overwrite_on_conflict:
         payload["overwrite_on_conflict"] = True
-    return await bridge.execute("scene.load_scene", payload)
+    return _with_hip_warning(await bridge.execute("scene.load_scene", payload))
 
 
 @mcp.tool()

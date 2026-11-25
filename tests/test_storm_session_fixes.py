@@ -202,6 +202,16 @@ def test_multiparm_instance_names_validate_against_the_template():
     assert not graph_handlers._is_instance_parm("pt0xy", patterns)
 
 
+def test_base1_tuple_components_of_later_instances_validate():
+    """attribcreate's value#v: value3v1 is real once numattr is 3 (4n/4o: it was refused)."""
+    import re
+
+    patterns = [re.compile(r"^value\d+v(?:[xyzwrgba]|\d+)?$")]
+    assert graph_handlers._is_instance_parm("value3v1", patterns)
+    assert graph_handlers._is_instance_parm("value3v", patterns)
+    assert not graph_handlers._is_instance_parm("value3", patterns)
+
+
 # ---------------------------------------------------------------- second storm session
 
 

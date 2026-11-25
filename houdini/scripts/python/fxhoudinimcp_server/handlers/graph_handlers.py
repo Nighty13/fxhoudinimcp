@@ -195,8 +195,9 @@ def _instance_patterns(node_type) -> list[re.Pattern]:
     A fresh probe node has zero instances, so `usept0` and `pt0x` on an Add
     SOP were reported as non-existent and a session fell back to a wrangle
     to make three points. The template names carry `#` where the instance
-    number goes; a live name is that with digits, plus an optional vector
-    component suffix.
+    number goes; a live name is that with digits, plus an optional component
+    suffix: a letter (`pt0x`) or a number for Base1-named tuples (attribcreate's
+    `value#v` is `value3v1`..`value3v4`).
     """
     patterns: list[re.Pattern] = []
 
@@ -204,7 +205,7 @@ def _instance_patterns(node_type) -> list[re.Pattern]:
         for template in templates:
             if "#" in template.name():
                 body = re.escape(template.name()).replace(r"\#", r"\d+")
-                patterns.append(re.compile(rf"^{body}[xyzwrgba]?$"))
+                patterns.append(re.compile(rf"^{body}(?:[xyzwrgba]|\d+)?$"))
             if template.type() == hou.parmTemplateType.Folder:
                 walk(template.parmTemplates())
 
@@ -1948,13 +1949,24 @@ def build_network(
             "validated_nodes": len(nodes),
             "validated_types": sorted(t.name() for t in resolved_types.values()),
         }
+        dry_warnings = []
         if in_the_way:
             result["expressions_in_the_way"] = in_the_way
-            result["warning"] = (
+            dry_warnings.append(
                 f"These parms hold an expression that a literal from the spec will not "
                 f"replace: {in_the_way}. Pass override_expression: true on the spec to "
                 f"clear it, or set the value as an expression."
             )
+        missing_ch = _spec_missing_ch_parms(resolved_types, nodes)
+        if missing_ch:
+            result["missing_channel_parms"] = missing_ch
+            dry_warnings.append(
+                f"These snippets read ch() parameters their node type does not have, so "
+                f'they will read 0 / "" until created: {missing_ch}. After the build, '
+                f"create them with create_spare_parameters."
+            )
+        if dry_warnings:
+            result["warning"] = " ".join(dry_warnings)
         return result
 
     ###### Phase 2: build (atomic — any failure rolls back)
@@ -2221,6 +2233,15 @@ def build_network(
             f"Callbacks asked for with run_callbacks did not go through: {not_run}. "
             f"The values were written; what the callback would have done was not."
         )
+    missing_ch = {
+        node.path(): names for node in created.values() if (names := _missing_ch_parms(node))
+    }
+    if missing_ch:
+        result["missing_channel_parms"] = missing_ch
+        warnings.append(
+            f"These wrangles read ch() parameters the node does not have, so they read "
+            f'0 / "": {missing_ch}. Create them with create_spare_parameters.'
+        )
     if warnings:
         result["warning"] = " ".join(warnings)
     if cache := dop_cache_note(created.values()):
@@ -2242,6 +2263,48 @@ def _has_snippet(node: Any) -> bool:
     with contextlib.suppress(Exception):
         return node.parm("snippet") is not None
     return False
+
+
+# ch("name"), chf("name"), chi(...), chv(...), chs(...), chramp(...): a bare
+# name, i.e. a parameter on the wrangle itself, not "../x" or "/obj/x".
+_CH_CALL = re.compile(r"\bch(?:f|i|s|v|u|p|ramp|4|2|3)?\s*\(\s*[\"']([A-Za-z_][\w]*)[\"']")
+
+
+def ch_parm_names(snippet: str) -> list[str]:
+    """Bare parameter names a VEX snippet reads with ch*(), in order, unique."""
+    return list(dict.fromkeys(_CH_CALL.findall(snippet or "")))
+
+
+def _spec_missing_ch_parms(resolved_types: dict, nodes: list) -> dict[str, list[str]]:
+    """{spec label: ch*() names its snippet reads that its node type lacks}."""
+    found: dict[str, list[str]] = {}
+    for index, spec in enumerate(nodes):
+        if not isinstance(spec, dict):
+            continue
+        snippet = (spec.get("parms") or {}).get("snippet")
+        node_type = resolved_types.get(spec.get("type"))
+        if not isinstance(snippet, str) or node_type is None:
+            continue
+        with contextlib.suppress(Exception):
+            group = node_type.parmTemplateGroup()
+            names = [n for n in ch_parm_names(snippet) if group.find(n) is None]
+            if names:
+                found[spec.get("name") or spec.get("type") or f"#{index}"] = names
+    return found
+
+
+def _missing_ch_parms(node: Any) -> list[str]:
+    """ch*() names in the node's snippet that are not parameters of the node."""
+    with contextlib.suppress(Exception):
+        snippet = node.parm("snippet")
+        if snippet is None:
+            return []
+        return [
+            name
+            for name in ch_parm_names(snippet.unexpandedString())
+            if node.parm(name) is None and node.parmTuple(name) is None
+        ]
+    return []
 
 
 def _is_branch_end(node: Any, among: list) -> bool:

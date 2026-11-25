@@ -611,6 +611,183 @@ claims (#1, #4) I checked by reading the lines myself; the rest come from a read
 - Measure against what the *final* geometry can represent: a heightfield cannot hold a vertical wall or a 3-cell-wide
   V. Several of my "regressions" this session were sampling limits, not logic errors; compare to the cell size first.
 
+## 4m. Humidity map + grass/tree scatter on terrain_road (2026-11-24, `HoudiniProjects/terrain_road`, `/obj/vegetation`)
+
+Built in one 53-node `build_network` (dry run first, zero errors): humidity from erosion `flow` + lake proximity +
+lowland - slope + shaded aspect + noise into a `humidity` layer, `veg_ok` layer, two `heightfield_scatter`s,
+`distancefromgeometry` to the road curve, a cull/variant wrangle per population, `copytopoints` with piece attribute.
+Result: 21.5k grass clumps (3 varieties), 805 trees (4 varieties), none within 18 m of the road.
+
+1. **Wrangle knobs are a trap with three silent steps (cost: one wrong "done" state and ~7 calls).** `build_network`
+   has no spec key for spare parms, so a snippet using `chf("road_clear")` cooks with 0. Adding the parms afterwards
+   with `create_spare_parameters` did **not** take effect: changing a knob and `verify_network(force_cook=True)` gave
+   byte-identical stats, and a forced `cook()` in Python still kept trees 0.16 m from the road while
+   `parm('road_clear').eval()` was 18. Only re-setting the snippet text (forcing a VEX recompile) applied them.
+   Fixes: (a) a `spare_parms` key in `build_network` specs, created before `snippet` is written; (b)
+   `create_spare_parameters` on a node with a `snippet` re-sets the snippet afterwards to force the recompile;
+   (c) dry run / `validate_vex` warns on `ch*("name")` calls naming no parm on the node.
+2. **Error counts include stock locked-HDA internals.** `get_scene_summary` said `error_count: 12` and
+   `find_error_nodes` listed 12 errors, all `get_piece` block_begins inside SideFX heightfield HDAs (uncooked
+   internals). Same root as 4l #6, now in two more tools. It alarmed the user. Fix: skip `isInsideLockedHDA()` by
+   default in all three tools, report `skipped_inside_locked_assets`.
+3. **`start_houdini(gui=True)` exits with code 3 and an empty log** when the MCP server runs without an interactive
+   desktop (Claude Code desktop agent shell). Headless works. Opening Houdini on the user's desktop (computer use) let
+   the plugin serve on 8100 and `get_houdini_connection_status` found it. The error should say: "the GUI needs an
+   interactive desktop: open Houdini yourself, it serves on its own; or use headless".
+4. **`heightfield_scatter` density mode also places points where the mask is 0** (233 trees, 4.9k grass under the
+   lake with `veg_ok` = 0). The heightfields guide warns only about coverage mode; widen it to "every scatter method:
+   multiply the keep probability by the mask after scattering".
+5. **`get_volume_info(compact=True, bins=[...])` drops the histogram silently**; only p50/p95 come back. Either return
+   the bins in compact rows or say they were dropped.
+6. **Vector parm component order is not on the card.** Tube `rad` is [top, bottom]; I wrote [bottom, top] and got
+   upside-down cones, caught only on a screenshot. `get_node_card` could carry component labels when the template
+   has them; agent-side lesson: after building a shape, `get_attrib_stats(group_by="P.y")` shows which end is wide.
+7. **Asset design note (not MCP):** `ste::terrain_road` has one merged output, so vegetation reads three internal
+   nulls (`OUT_TERRAIN_FINAL`, `OUT_WATER`, `ROAD_CURVE`) through object merges. Separate outputs would make
+   downstream tools independent of the asset's internals.
+
+**Status (same day, fixed and checked live on 22.0.508; 7 new tests, 2071 pass):**
+- #1 fixed: `create_spare_parameters` re-writes a node's `snippet` after adding parms (`vex_recompiled: true`);
+  a probe showed re-setting the identical text is enough, while a value change or `cook(force=True)` is not.
+  `build_network` reports `missing_channel_parms` + a warning, at dry run (against the node type) and after a build
+  (against the node). The `spare_parms` spec key was left out: the warning plus the recompile cover it.
+- #2 fixed: `find_error_nodes` does not enter locked assets (`locked_assets_not_entered`, `include_locked_assets`
+  to opt in); `get_scene_summary` counts them apart (`errors_inside_locked_assets`). This scene: 12 → 0.
+- #3 fixed: `start_houdini(gui=True)` with an empty log now says the GUI needs a desktop and what to do instead.
+- #4 fixed in the heightfields guide (every scatter method; plus the humidity-layer and distancefromgeometry recipe).
+- #5 fixed: compact rows carry a `hist` column of counts.
+- #6, #7 not changed: Houdini's templates carry no component meaning for Tube `rad`, and #7 is the asset's design.
+- MCP-side signature changes (`find_error_nodes(include_locked_assets)`, session hint) load on the next client
+  reconnect; the Houdini-side handlers were reloaded with `reload_plugin`.
+
+Worked well: `build_network` validated and built 53 nodes in one call;
+`get_attrib_stats(group_by=..., bucket_size=...)` gave the density-vs-road-distance profile in one call;
+`capture_screenshot(node=..., camera=...)` showed the humidity layer without moving display flags;
+`get_geometry_info`'s `cook_count` / `cooked_for_this_call` separated "stale read" from "VEX ignores the parm".
+
+## 4n. Stylized cliff HDA + session bring-up cost (2026-11-25, `HoudiniProjects/stylized_cliff`)
+
+Built `stefalcon::stylized_cliff` (18 nodes, one `build_network` after one dry run): footprint (default circle or
+optional closed curve on input 0, `switch` on `opinputpath`) -> one extruded slab copied to a jittered/tapered
+strata line -> VDB union + smooth -> stretched mountain noise -> PolyReduce facets -> flat normals -> up-facing
+prims grouped `top` and coloured. 16 knobs on two tabs, all nodes-only, zero `execute_python`, zero wrangles.
+Total MCP calls for the build: ~25. Most of the wall-clock went to **getting Houdini up**, not to the build.
+
+1. **Bring-up has no tool path (cost: ~2 min of blind waits, 3 polls, a computer-use grant).** Known from 4m #3,
+   so I skipped `start_houdini(gui=True)` and opened Houdini via computer use. Then nothing tells you when the
+   plugin is ready: `get_houdini_connection_status` returns instantly, so the agent sleeps and re-polls. Fix: a
+   `wait_for_houdini(timeout=180)` (or `start_houdini(..., wait=True)`) that blocks until /health answers, and a
+   launcher that works from the agent shell (try `Start-Process houdini.exe` detached, which inherits the user's
+   desktop session, before falling back to "open it yourself").
+2. **A fresh session sits in `$HFS/bin/untitled.hip`.** `hip_file` was `C:/Program Files/.../bin/untitled.hip`; a
+   `save_scene()` or `$HIP`-relative cache before the first explicit save would write into Program Files (or fail).
+   Fix: `get_houdini_connection_status` / `build_network` warn when `$HIP` is under `$HFS`; better, a
+   `new_project(name)` tool that makes `HoudiniProjects/<name>/{hda,scripts,shots,cache}`, sets `$JOB`, and saves
+   the hip there before any work.
+3. **No "open existing project" index.** `load_scene` needs an exact path; the projects live only in my memory
+   notes. A `list_projects(root)` (hip + hda + last-modified per folder) would make "open the river project" one call.
+4. **`set_hda_interface` renamed my second tab folder** `style_tab` -> `shape_tab_1` (reported in
+   `renamed_by_houdini`, good). Any `hide_when` naming `style_tab` would silently break. Nice-to-have: keep the
+   requested name when no conditional or link refers to the series.
+5. **The discipline guide is ~10k tokens** and the server instructions say to read it every session. Worth a
+   "short" variant (the 10 rules + lessons headings) with the long one on demand.
+6. Agent lesson (not MCP): `copytopoints` `pscale` scales slab thickness too, so high taper opened gaps between
+   strata (floating top slabs, caught on a screenshot of a seed/taper variant). Fixed by dividing the extrude
+   distance by the minimum pscale. A `connectivity` + class count would have caught it numerically.
+
+7. **The Unreal bridge that exists is invisible to an agent.** `extras/unreal/ue_exec.py` (remote execution) and
+   `docs/how-to/houdini-unreal-workflow.md` were written by earlier sessions, but no tool, guide or server
+   instruction names them, so this session re-derived a `-ExecutePythonScript` launch the doc says not to use.
+   Fix: the `game_assets` / `unreal_landscape` guides open with "drive Unreal through X", and the server
+   instructions name it.
+8. **UE 5.8 ships Epic's own MCP server** (`Engine/Plugins/Experimental/ModelContextProtocol`, "Unreal MCP",
+   experimental, HTTP `http://127.0.0.1:8000/mcp`, can write the Claude Code client config itself) with ~30
+   toolsets of `UFUNCTION(meta=(AICallable))` tools (EditorToolset: CaptureViewport, GetLogEntries, SelectActors,
+   StartPIE...; PCG, Niagara, StateTree...). No Python-exec or Houdini Engine tool among them. Candidate long-term
+   bridge: enable it, and add a small Houdini Engine toolset (import HDA, instantiate, get/set parms, recook, bake).
+
+9. **Done (same day): Unreal bridge on Epic's MCP.** `extras/unreal/setup_unreal_project.py` (one-command project
+   setup), `extras/unreal/HoudiniEngineToolset` (Python-only toolset, 11 tools), `ue_mcp_call.py`. Verified on
+   `D:/unreal_test_projects/OpenWorldTemplate`: new level, import, spawn, 16 parms read, 5 parms set -> recook
+   (half-height 13.8 -> 18.0 m), `CaptureViewport` image, level saved, all with no computer use.
+   Root causes hit: `HOME` from Git Bash hides Documents prefs (Houdini GUI never loaded the plugin; fixed in
+   `start_houdini`); HE's default curve on an optional input (HDA guard); MSYS path rewriting of `/Game/...`.
+10. **Still missing for zero-computer-use work:** (a) start/stop/wait for the Unreal editor (the editor *is* the
+    MCP server, so this has to live outside it: an `fxhoudinimcp` `start_unreal(project)` like `start_houdini`);
+    (b) first-run modal dialogs (Houdini "Start Here" in a fresh prefs dir, UE rebuild/restore prompts) still need
+    a click; (c) `list_hda_actors` reads `asset: null` (no Python getter found yet); (d) a vertex-colour material
+    for HE output; (e) new fxhoudinimcp tools appear only after the MCP client reconnects.
+
+Worked well: `build_network` with `{"indirect_input": 0}` for the optional HDA input; `create_hda(inputs=[...])`
+then `set_hda_interface` then building internals with `ch('../x')` (no CTRL null, no missing-parm errors);
+`capture_screenshot(node=, camera={direction})` for consistent before/after frames without touching flags;
+`tidy_network(layout=False)` documenting the graph without moving nodes.
+
+## 4o. Houdini <=> Unreal stress test (2026-11-25, `HoudiniProjects/he_stress_test`, UE `D:/unreal_test_projects/OpenWorldTemplate`)
+
+Bridge as it stands after this pass: fxhoudinimcp `tools/unreal.py` (`start_unreal`, `stop_unreal`,
+`unreal_status`, `unreal_python` over Epic's remote execution, `unreal_call` proxy to Epic's Unreal MCP,
+`unreal_capture`), `extras/unreal/HoudiniEngineToolset` (14 Houdini Engine tools, Python only),
+`extras/unreal/recipes/` (levels, materials, assets), `setup_unreal_project.py`, `reload_toolset.py`.
+Design rule (user, same day): **no tool per operation**. Tools only where they hold Houdini Engine
+knowledge; everything else is `unreal_python` plus a tested recipe.
+
+Results (screenshots in `HoudiniProjects/he_stress_test/shots/`):
+| Test | Result | Evidence |
+|---|---|---|
+| 1 River spline drives terrain HDA | pass | 3 curve edits from UE recarve valley, layers, scatter; `t1_*` |
+| 2 Houdini scatter -> UE foliage | pass | 387 ISM, then `unreal_foliage` -> InstancedFoliageActor 7 types; `t2_*` |
+| 3 Landscape edit layers | pass | second HDA writes additive "Houdini Craters"; hidden = gone; `t3_*` |
+| 4 Rigged animated octopus | pass | 81 joints, 2.46 s anim, 3 actors at 0/0.6/1.2 s differ; `t4_*` |
+| 5 Flowmap bake -> UE material | pass | 505^2 RGB flowmap, HLSL advection; 93% water px change in 2 s vs 11% elsewhere; `t5_*` |
+
+Houdini Engine / Unreal behaviour found (now in the guides, `unreal_landscape` + `game_assets`):
+1. Optional curve input gets a default 2 m, 2-point spline: guard the switch (cliff and valley HDAs).
+2. Re-importing a changed HDA into a live session crashed HARS on the next spawn (editor frozen 4 min,
+   then "session lost"); `restart_houdini_session` fixes it. Placed actors keep the old interface until
+   `recook_hda(rebuild=True)`.
+3. Proxy meshes carry no vertex colours (cliff looked white); `refine_hda`.
+4. Actors (a Landscape) need a World input; a Geometry input refuses them with only a log warning.
+5. `unreal_landscape_editlayer_clear` on a *generating* landscape flattened the heights (z 0) while
+   repainting layers. Verified by A/B (attribute off -> heights back).
+6. Rebuild recreates the landscape: other HDAs' edit layers on it are lost.
+7. FBX character export needs a prim `name`/`path` on the skin.
+8. `CaptureViewport` requires `captureTransform` and `annotations` despite calling them optional
+   (wrapped by `unreal_capture`). Template_Default auto exposure washes colours out (recipe level fixes it).
+9. Stale paint weights after a curve edit were seen once; not reproduced after a rebuild. Unconfirmed.
+
+My own HDA bugs the tools caught (agent lessons, guide lines added where general):
+`add` "Delete Geometry But Keep the Points" kept the volumes and dropped free points (use blast `*`);
+`volumesample` at terrain height reads a heightfield's border (cull did nothing: Houdini and UE both 387);
+water `unreal_material` as a point attribute; detail `unreal_foliage` would leak onto merged parts.
+
+MCP friction (fxhoudinimcp):
+- `build_network` validation rejects `value3v1` on attribcreate's 3rd multiparm entry (`value1v1` fine,
+  tuple `value3v` fine). Probe-based validation does not expand `numattr` for tuple components.
+- `new_scene` returns `hip_file` under Program Files without the `hip_warning` (only connection status has it).
+- `set_wrangle_code` takes `vex_code`, not `code`; every other code tool says `code`. Alias it.
+- `unreal_capture` frames on actor bounds; a 500 m landscape plus foliage frames loosely.
+- Unreal tools reach this session only through harness scripts until the MCP client reconnects
+  (`$TMP/u.py`, `rx.py`); the same holds for any new fxhoudinimcp tool (4n #10e).
+- Still open: 315 instances in UE vs 319 in Houdini for the "same" curve (HE curve conversion?);
+  octopus material assignment did not show (grey); water edge shows a dark strip (bank shadow or
+  flowmap offset, not determined).
+
+**Status (same day, fixed; 10 new tests, 2097 pass, ruff clean):**
+- `build_network` multiparm validation: instance patterns accept a numbered component (`value3v1`);
+  checked live (dry run of attribcreate entry 3 passes).
+- `new_scene` / `load_scene` replies carry `hip_warning` when the hip sits in Houdini's install folder.
+- Argument synonyms: an undeclared argument is renamed when exactly one declared synonym exists and was not
+  given (`code` <-> `vex_code`, `snippet`, `node`/`path` -> `node_path`), in the shared forbid-unknown
+  validator, so every tool gets it. MCP-side: loads on the next client reconnect.
+- New: `list_node_types(context, menus_only=True)` returns the TAB-menu tree with node counts (from HDA
+  Tools.shelf `<toolSubmenu>` plus shelf tools; 0.05 s, cached), `menu="Labs/World Building"` lists a branch
+  with each node's `menu`. Live: 125 SOP submenus, Labs 242 nodes, third-party (Gaea, ZibraVDB) show too;
+  391 compiled core SOPs have no TAB submenu (the discipline guide's generated domains cover those).
+  Named in the server instructions (rule 2).
+- Not changed: `unreal_capture` framing (cosmetic), 315 vs 319 instance count, octopus material, water edge
+  strip (unexplained; recorded above).
+
 ## 5. Session log
 
 - 2026-11-23: River/terrain built (`HoudiniProjects/river_test`). 4 `execute_python` fallbacks: curve stash
@@ -632,3 +809,8 @@ claims (#1, #4) I checked by reading the lines myself; the rest come from a read
   vertical steps only at real falls. 4 items in 4k.
 - 2026-11-24 (pass 8): fall refine + symmetric sheet zone + carve margin; code-level recommendations in 4l
   (top: FXHoudiniError must subclass ToolError, build_network VEX validation, verify_network cooking).
+- 2026-11-24 (terrain_road vegetation): humidity layer + 3 grass / 4 tree varieties, road falloff. 7 items in 4m;
+  top: wrangle spare parms never reach compiled VEX, error counts include locked-HDA internals, GUI start fails
+  without a desktop.
+- 2026-11-25: stylized cliff HDA (`HoudiniProjects/stylized_cliff`), nodes-only, curve input tested. 6 items in 4n;
+  top: no wait-until-ready / launch path, fresh session's $HIP is under $HFS, no project index or scaffold.

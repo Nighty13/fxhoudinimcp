@@ -250,8 +250,18 @@ async def list_node_types(
     filter: str | None = None,
     limit: int = 200,
     all_versions: bool = False,
+    menu: str | None = None,
+    menus_only: bool = False,
 ) -> dict:
     """List available node types for a context category.
+
+    Browse like the TAB menu: menus_only=True returns the context's TAB-menu
+    tree with a node count per submenu ("Labs/World Building/Vegetation",
+    "Environments/Terrain", "Animation/Rigging"...), narrowed by `menu`; then
+    menu="Labs/World Building" lists the nodes under that branch, each with
+    its `menu` paths. This is how to see what an install offers (Labs,
+    studio HDAs) without guessing names; filter= still searches names/labels.
+    Compiled nodes without a TAB submenu are grouped "(no TAB submenu)".
 
     Only the newest version of each versioned type is listed
     (labs::vertex_animation_textures::4.0, not 2.0 .. 3.0); the number of
@@ -269,11 +279,19 @@ async def list_node_types(
         filter: Substring to filter type name or label (case-insensitive).
         limit: Max entries to return (default 200, max recommended 200).
         all_versions: List every version of a versioned type.
+        menu: TAB-menu path prefix (case-insensitive), e.g. "Labs" or
+            "Labs/Geometry/Mesh: Create".
+        menus_only: Return the TAB-menu tree with node counts instead of types.
     """
     bridge = _get_bridge(ctx)
     params: dict = {"context": context, "limit": limit}
     if all_versions:
         params["all_versions"] = True
+    # Sent only when used, so an older plugin still answers plain listings.
+    if menu is not None:
+        params["menu"] = menu
+    if menus_only:
+        params["menus_only"] = True
     if filter is not None:
         params["filter"] = filter
     return await bridge.execute("nodes.list_node_types", params)

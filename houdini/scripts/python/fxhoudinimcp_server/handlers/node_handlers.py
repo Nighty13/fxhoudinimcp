@@ -793,11 +793,62 @@ def _latest_versions_only(entries: list) -> tuple[list, int]:
     return kept, len(entries) - len(kept)
 
 
+_MENU_CACHE: dict[str, tuple[int, dict[str, list[str]]]] = {}
+
+
+def _tab_menus(category) -> dict[str, list[str]]:
+    """TAB-menu submenus per node type name, as Houdini's TAB menu shows them.
+
+    Two sources: an HDA's own Tools.shelf section (`<toolSubmenu>`, every Labs
+    and SideFX asset; 1129 of 1156 SOP assets on 22.0) and shelf tools that
+    create a compiled node (genericTool(kwargs, '<type>')). Cached per category
+    until the number of types changes (an HDA installed).
+    """
+    import html
+
+    types = category.nodeTypes()
+    cached = _MENU_CACHE.get(category.name())
+    if cached and cached[0] == len(types):
+        return cached[1]
+    menus: dict[str, list[str]] = {}
+
+    def add(type_name: str, submenu: str) -> None:
+        submenu = html.unescape(submenu).strip()
+        if submenu and submenu not in menus.setdefault(type_name, []):
+            menus[type_name].append(submenu)
+
+    for type_name, node_type in types.items():
+        with contextlib.suppress(Exception):
+            definition = node_type.definition()
+            section = definition.sections().get("Tools.shelf") if definition else None
+            if section:
+                for submenu in re.findall(
+                    r"<toolSubmenu>([^<]+)</toolSubmenu>", section.contents()
+                ):
+                    add(type_name, submenu)
+    with contextlib.suppress(Exception):
+        for tool in hou.shelves.tools().values():
+            with contextlib.suppress(Exception):
+                if not any(
+                    c.name() == category.name()
+                    for c in tool.toolMenuCategories(hou.paneTabType.NetworkEditor)
+                ):
+                    continue
+                found = re.search(r"genericTool\(kwargs,\s*['\"]([^'\"]+)['\"]", tool.script())
+                if found and found.group(1) in types:
+                    for submenu in tool.toolMenuLocations():
+                        add(found.group(1), submenu)
+    _MENU_CACHE[category.name()] = (len(types), menus)
+    return menus
+
+
 def list_node_types(
     context: str,
     filter: str = None,
     limit: int = 200,
     all_versions: bool = False,
+    menu: str = None,
+    menus_only: bool = False,
     **_,
 ) -> dict:
     """List available node types in a given context category.
@@ -835,6 +886,36 @@ def list_node_types(
     else:
         # Six VAT ROPs and four biome scatters: tokens, and a chance to pick an old one.
         type_list, hidden_versions = _latest_versions_only(entries)
+
+    if menu is not None or menus_only:
+        menus = _tab_menus(category)
+        for record in type_list:
+            record["menu"] = menus.get(record["name"], [])
+        if menus_only:
+            tree: dict[str, int] = {}
+            for record in type_list:
+                for path in record["menu"] or ["(no TAB submenu)"]:
+                    parts = path.split("/")
+                    for depth in range(1, len(parts) + 1):
+                        key = "/".join(parts[:depth])
+                        tree[key] = tree.get(key, 0) + 1
+            prefix = (menu or "").lower().rstrip("/")
+            rows = [
+                {"menu": key, "node_count": count}
+                for key, count in sorted(tree.items())
+                if not prefix or key.lower() == prefix or key.lower().startswith(prefix + "/")
+            ]
+            return {
+                "context": context,
+                "menus": rows,
+                "hint": "list_node_types(context, menu='<path>') lists the nodes under one.",
+            }
+        prefix = menu.lower().rstrip("/")
+        type_list = [
+            t
+            for t in type_list
+            if any(m.lower() == prefix or m.lower().startswith(prefix + "/") for m in t["menu"])
+        ]
 
     if filter:
         f = filter.lower()

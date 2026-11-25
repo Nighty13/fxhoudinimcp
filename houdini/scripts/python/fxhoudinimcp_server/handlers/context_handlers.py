@@ -614,16 +614,21 @@ def _get_scene_summary(**_: Any) -> dict:
                 }
             )
 
-    # Total node count and error scan
+    # Total node count and error scan. Errors inside locked assets (stock
+    # heightfield nodes' unused for-each blocks) are not the scene's errors.
     total_nodes = 0
     error_count = 0
+    errors_inside_locked_assets = 0
     root = hou.node("/")
     if root is not None:
         all_nodes = root.allSubChildren()
         total_nodes = len(all_nodes)
         for node in all_nodes:
             if _has_errors(node):
-                error_count += 1
+                if _inside_locked_asset(node):
+                    errors_inside_locked_assets += 1
+                else:
+                    error_count += 1
 
     # Timeline info
     current_frame = hou.frame()
@@ -639,6 +644,7 @@ def _get_scene_summary(**_: Any) -> dict:
         "stage_children": stage_children,
         "total_nodes": total_nodes,
         "error_count": error_count,
+        "errors_inside_locked_assets": errors_inside_locked_assets,
         "current_frame": current_frame,
         "frame_range": frame_range,
         "fps": fps,
